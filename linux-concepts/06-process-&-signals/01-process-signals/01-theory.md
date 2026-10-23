@@ -1,1069 +1,868 @@
-# systemd & Services — Practice (Note 12)
+# Processes & Signals — Theory (Note 9)
 
-Rebuilding the team server's services properly with systemd, step by step. Each step shows the command, what the result means, and the decision it leads to.
+What a running program is, how to see and inspect it, how processes start, wait, and end, and how you (and the system) talk to them with signals.
 
-**Theory for this note:** Note 11. Each step points to the phase that explains it ("Why: Note 11, Phase X").
+**Series:**
+- Note 1: Shell & Processes
+- Note 2: Environment Variables
+- Note 3 / 4: Users, Groups & Identity
+- Note 5 / 6: Files, Directories & Permissions
+- Note 7 / 8: Privilege & Delegation
+- **Note 9: Processes & Signals — Theory** ← this note
+- Note 10: Processes & Signals — Practice
+- Note 11 / 12: systemd & Services — Theory / Practice
+- Note 13 / 14: Logs, Timers & Resource Limits — Theory / Practice
 
-**Continues from:** Note 10 (processes and signals on the same server). **Continues into:** Note 14 (logs, timers, and resource limits for these services).
+Note 1 explained how the shell **creates** a process (fork + exec). This note is about everything after that: what a process holds, the states it goes through, how it ends, and how to control it.
+
+Each phase ends with **"Used in"** (Note 10 steps) and, where relevant, **"How this goes wrong"** for the security track.
 
 ---
 
 ## Contents
 
-- The setup
-- Step 0 — Look at the current services
-- Step 1 — Rewrite the API unit properly
-- Step 2 — The worker didn't come back after a reboot
-- Step 3 — The API logs errors at every boot
-- Step 4 — How should the worker relate to the API?
-- Step 5 — A crash loop that left the API down for two hours
-- Step 6 — Restarts that still kill the worker's jobs
-- Step 7 — Changing a package's service (nginx) safely
-- Step 8 — Three workers from one file
-- Step 9 — A developer's own service, without sudo
-- Step 10 — Boot got two minutes slower
-- Step 11 — Audit the units
-- State of the server after Note 12
-- Scenario recap
-- Troubleshooting table
-- Appendix — Command reference
+1. Phase 1 — What a process is
+2. Phase 2 — What a process carries: a tour of `/proc`
+3. Phase 3 — Seeing processes: `ps`, `pgrep`, `pstree`, `top`
+4. Phase 4 — Process states and how a process ends
+5. Phase 5 — Zombies, orphans, and PID 1
+6. Phase 6 — Signals
+7. Phase 7 — Terminals, sessions, and jobs
+8. Phase 8 — Handling signals: graceful shutdown
+9. Phase 9 — Priority: `nice` and `ionice`
+10. Phase 10 — Stuck processes: the `D` state
+11. How this goes wrong — overview
+12. Summary table
+13. Appendix — Command reference
 
 ---
 
-# The setup
+# Phase 1 — What a process is
 
-Same server as Notes 4–10.
+## 1.1 Program vs process
 
-| Unit | Current state |
+| | Program | Process |
+|---|---|---|
+| What | A **file** on disk (`/usr/bin/node`) | A **running instance** of a program, in memory |
+| How many | One file | Many processes can run the same program at once |
+| Lasts | Until deleted | Until it exits or is killed |
+
+Running `node server.js` twice gives **two processes** from **one program**.
+
+## 1.2 PID and PPID
+
+Every process has:
+
+| ID | Meaning |
 |---|---|
-| `api.service` | Written quickly in Note 2, hardening added in Note 8 as `override.conf` |
-| `worker.service` | Written quickly in Note 2, hardening added in Note 8 |
-| `nginx.service` | Installed from apt; serves the frontend on 443 |
+| **PID** | Process ID — a unique number while it runs |
+| **PPID** | Parent process ID — the PID of the process that created it |
 
-Changes from Notes 9–10 that matter here: the worker now handles `SIGTERM` gracefully (Note 10, Step 4), and jobs like reindexes run with `systemd-run` (Note 10, Step 2).
+```bash
+echo $$          # PID of your current shell
+echo $PPID       # PID of its parent (e.g. sshd)
+```
+
+PIDs are reused after a process ends. The highest possible PID is in `/proc/sys/kernel/pid_max`.
+
+## 1.3 The process tree
+
+Because every process has a parent (Note 1: fork + exec), all processes form a **tree**.
+
+```
+systemd (PID 1)
+├── sshd
+│   └── sshd: thirana
+│       └── bash (your shell)
+│           └── ps
+├── node /opt/api/current/server.js   (the api service)
+└── python -m worker                  (the worker service)
+```
+
+```bash
+pstree -p          # the tree with PIDs
+```
+
+Two special PIDs:
+
+| PID | Process | Role |
+|---|---|---|
+| **1** | `systemd` (the **init** process) | The first user-space process. Starts everything else, adopts orphans (Phase 5) |
+| **2** | `kthreadd` | Parent of all **kernel threads** (names in `[brackets]`, e.g. `[kworker/0:1]`) |
+
+## 1.4 Processes and threads
+
+A process can have several **threads** — parallel paths of execution that **share** the process's memory and open files. Node has one main JavaScript thread plus helper threads; a Java server can have hundreds.
+
+```bash
+ps -L -p <PID>        # one line per thread
+ls /proc/<PID>/task   # one folder per thread
+```
+
+For most of this note, "process" is what matters. Threads come up again with CPU usage (Phase 3) and resource limits (Note 13).
+
+**Used in:** Note 10, Steps 0, 1.
 
 ---
 
-# Step 0 — Look at the current services
+# Phase 2 — What a process carries: a tour of `/proc`
+
+## 2.1 What a process holds
+
+Earlier notes each covered one part of a process. Together:
+
+| Part | Explained in |
+|---|---|
+| Program code and memory | This note |
+| Identity: UIDs, GIDs, groups | Note 3, Note 7 |
+| Environment variables | Note 2 |
+| Current directory | Note 1 |
+| Open files (including stdin/stdout/stderr) | This note |
+| umask | Note 5 |
+| Capabilities | Note 7 |
+| Resource limits, cgroup | Note 13 |
+| Priority (nice value) | Phase 9 |
+| State | Phase 4 |
+
+## 2.2 `/proc/<PID>` — the process as files
+
+`/proc` isn't on disk. The kernel shows each running process as a folder, `/proc/<PID>/`, and you read it like files.
+
+| Path | Shows |
+|---|---|
+| `/proc/PID/status` | Name, state, PPID, UIDs/GIDs, groups, memory, capabilities, threads (easy to read) |
+| `/proc/PID/cmdline` | The full command line (parts separated by `\0`) |
+| `/proc/PID/environ` | Environment at start (Note 2) |
+| `/proc/PID/exe` | Link to the **actual program file** being run |
+| `/proc/PID/cwd` | Link to its current directory |
+| `/proc/PID/fd/` | One link per **open file**, socket, or pipe |
+| `/proc/PID/limits` | Resource limits (Note 13) |
+| `/proc/PID/task/` | Its threads |
 
 ```bash
-systemctl status api
-```
-```
-● api.service - API
-     Loaded: loaded (/etc/systemd/system/api.service; enabled; preset: enabled)
-    Drop-In: /etc/systemd/system/api.service.d
-             └─override.conf
-     Active: active (running) since Tue 2026-10-20 09:12:03 +0530; 7h ago
-   Main PID: 2890 (node)
-      Tasks: 11 (limit: 4558)
-     Memory: 96.0M (peak: 120.4M)
-     CGroup: /system.slice/api.service
-             └─2890 /usr/bin/node /opt/api/current/server.js
+PID=$(pgrep -f 'node /opt/api')
+tr '\0' ' ' < /proc/$PID/cmdline; echo      # node /opt/api/current/server.js
+sudo ls -l /proc/$PID/exe                   # -> /usr/bin/node
+sudo ls -l /proc/$PID/cwd                   # -> /opt/api/releases/2026-10-17-2
+sudo ls -l /proc/$PID/fd | head             # 0 -> /dev/null, 1 -> socket:[...], ...
+grep -E '^(Name|State|PPid|Uid|Threads|VmRSS)' /proc/$PID/status
 ```
 
-**Meaning:** running, enabled at boot, with one drop-in from Note 8. (Why: Note 11, Phase 5.2.)
+Reading another user's `/proc/PID/environ`, `exe`, `cwd`, or `fd` needs **the same user or root** (Note 2, Phase 6.1).
 
-See the files systemd actually combines:
+## 2.3 File descriptors 0, 1, 2
+
+Every process starts with three open files:
+
+| fd | Name | Usually |
+|---|---|---|
+| 0 | stdin | Keyboard, or `/dev/null` for services |
+| 1 | stdout | Terminal, a file, a pipe, or the journal (for services) |
+| 2 | stderr | Same choices as stdout |
 
 ```bash
-systemctl cat api
+ls -l /proc/$$/fd       # your shell: 0, 1, 2 -> /dev/pts/0 (your terminal)
 ```
+
+This explains a lot of later behaviour: when a terminal closes, fds 0–2 point to something that's gone (Phase 7).
+
+**Used in:** Note 10, Steps 0, 1, 9.
+
+---
+
+# Phase 3 — Seeing processes: `ps`, `pgrep`, `pstree`, `top`
+
+## 3.1 `ps` — a snapshot
+
+`ps` prints the processes at one moment. Two common styles:
+
+```bash
+ps aux        # BSD style: every process, with user, CPU, memory
+ps -ef        # UNIX style: every process, with PPID
 ```
-# /etc/systemd/system/api.service
-[Unit]
-Description=API
-After=network.target
 
-[Service]
-User=api
-EnvironmentFile=/etc/myapps/common.env
-EnvironmentFile=/etc/myapps/api.env
-ExecStart=/usr/bin/node /opt/api/current/server.js
-Restart=on-failure
-RestartSec=1
+The most useful form is **choosing your own columns**:
 
-[Install]
-WantedBy=multi-user.target
+```bash
+ps -eo pid,ppid,user,stat,etime,%cpu,%mem,rss,cmd --sort=-%cpu | head
+```
 
-# /etc/systemd/system/api.service.d/override.conf
-[Service]
-NoNewPrivileges=yes
-AmbientCapabilities=CAP_NET_BIND_SERVICE
+| Column | Meaning |
+|---|---|
+| `pid` / `ppid` | Process / parent ID |
+| `user` | Effective user |
+| `stat` | State (Phase 4) plus flags |
+| `etime` | Time since it started |
+| `%cpu` | CPU use, **averaged over its whole life** (not "right now") |
+| `%mem` / `rss` | Share of RAM / actual RAM in use (KB) |
+| `cmd` | Full command line |
+
+Other handy forms:
+
+```bash
+ps -fp 2890                 # one process, full format
+ps -u api                   # processes of one user
+ps -f --ppid 2890           # children of a process
+ps -o pid,ni,pri,cmd -p 2890   # priority
+```
+
+## 3.2 Finding PIDs
+
+```bash
+pgrep -a node               # PIDs + command lines matching "node"
+pgrep -u worker -a python   # only user worker's
+pgrep -f 'server.js'        # match the full command line, not just the name
+pidof node                  # PIDs of an exact program name
+```
+
+`pgrep` is safer in scripts than `ps | grep` (which also matches the `grep` itself).
+
+## 3.3 `pstree` — the family view
+
+```bash
+pstree -p           # whole tree with PIDs
+pstree -p 2890      # one subtree
+pstree -s -p 2890   # its ancestors up to PID 1
+```
+
+## 3.4 `top` / `htop` — live view
+
+```bash
+top
+```
+
+```
+top - 10:05:12 up 3 days,  2:11,  2 users,  load average: 0.42, 0.35, 0.30
+Tasks: 141 total,   1 running, 140 sleeping,   0 stopped,   0 zombie
+%Cpu(s):  3.1 us,  0.8 sy,  0.0 ni, 95.9 id,  0.1 wa, ...
+MiB Mem :   3923.4 total,    812.0 free,   1430.2 used,   1681.2 buff/cache
+
+  PID USER   PR  NI    VIRT    RES   SHR S  %CPU  %MEM     TIME+ COMMAND
+ 2890 api    20   0 1103420  98232 38120 S   2.3   2.4   1:12.33 node
+```
+
+| Part | Meaning |
+|---|---|
+| `load average` | Average number of processes running or waiting, over 1/5/15 min (full meaning in the resources area later) |
+| `Tasks` | Count by state — watch the **zombie** number |
+| `%Cpu`: `us` / `sy` / `ni` / `id` / `wa` | User code / kernel / niced processes / idle / **waiting for disk** |
+| `PR` / `NI` | Kernel priority / nice value (Phase 9) |
+| `RES` | RAM actually used |
+| `S` | State |
+| `%CPU` | CPU use **right now** (unlike `ps`) |
+
+Useful keys in `top`:
+
+| Key | Action |
+|---|---|
+| `P` / `M` | Sort by CPU / memory |
+| `c` | Show full command lines |
+| `1` | Show each CPU core |
+| `H` | Show threads |
+| `u` | Filter by user |
+| `k` | Send a signal to a PID |
+| `r` | Renice a PID |
+| `q` | Quit |
+
+`htop` is a friendlier version (colour, scrolling, tree view with `F5`). Install with `sudo apt install htop`.
+
+**Used in:** Note 10, Steps 0, 1, 7.
+
+---
+
+# Phase 4 — Process states and how a process ends
+
+## 4.1 The states
+
+The `S` / `stat` column shows one letter:
+
+| Letter | State | Meaning |
+|---|---|---|
+| `R` | Running | Using a CPU, or ready and waiting for one |
+| `S` | Sleeping | Waiting for something (a network request, a timer, input). **Most processes, most of the time** |
+| `D` | Uninterruptible sleep | Waiting inside the kernel, usually for disk or network storage. Can't be interrupted (Phase 10) |
+| `T` | Stopped | Paused by a signal (`Ctrl+Z`, `SIGSTOP`) |
+| `t` | Traced | Paused by a debugger |
+| `Z` | Zombie | Finished, but parent hasn't collected its exit status (Phase 5) |
+| `I` | Idle | An idle kernel thread |
+
+Extra characters after the letter in `ps`:
+
+| Char | Meaning |
+|---|---|
+| `s` | Session leader (e.g. a login shell) |
+| `+` | In the foreground of a terminal |
+| `l` | Has several threads |
+| `<` / `N` | High / low priority |
+
+Example: `Ssl` = sleeping, session leader, multi-threaded. `R+` = running in the foreground.
+
+## 4.2 The lifecycle
+
+```
+         fork + exec (Note 1)
+              │
+              ▼
+        ┌──► R (running) ◄──────┐
+        │     │                 │
+        │     ├── waits ──► S / D ── event done ──┘
+        │     │
+        │     ├── SIGSTOP / Ctrl+Z ──► T ── SIGCONT ──┘
+        │     │
+        │     └── exits (returns, exit(), or killed by a signal)
+        │                 │
+        │                 ▼
+        │            Z (zombie: exit status kept for the parent)
+        │                 │
+        │           parent calls wait()
+        │                 │
+        │                 ▼
+        │              gone (PID free)
+```
+
+## 4.3 Exit codes
+
+When a process ends, it leaves an **exit code** (0–255) for its parent:
+
+| Code | Meaning |
+|---|---|
+| `0` | Success |
+| `1`–`125` | Failure (meaning depends on the program) |
+| `126` | Found, but not executable (Note 5) |
+| `127` | Command not found |
+| `128 + N` | **Killed by signal N** (shell convention) |
+
+```bash
+sleep 100 &
+kill -TERM $!
+wait $!; echo $?      # 143  = 128 + 15 (SIGTERM)
+```
+
+Common ones you'll see in logs: **130** (Ctrl+C, SIGINT), **137** (SIGKILL — often the OOM killer, Note 13), **143** (SIGTERM).
+
+## 4.4 Waiting for a child
+
+A parent **collects** a child's exit code with the `wait()` system call. In bash:
+
+```bash
+long_task &        # start in background; $! = its PID
+pid=$!
 ...
+wait $pid          # pause until it ends
+echo "exit code: $?"
 ```
 
-**Meaning:** the base file is minimal: no `Type=`, no `WorkingDirectory=`, `RestartSec=1`, ordered only after `network.target`. Each of those causes a problem later in this note. (Why: Note 11, Phase 3.3.)
-
-Check for anything broken:
-
-```bash
-systemctl list-units --failed
-systemctl is-enabled api worker nginx
-```
-```
-0 loaded units listed.
-enabled
-disabled
-enabled
-```
-
-**Meaning:** nothing failed now — but **`worker` is disabled**. It's running only because someone started it by hand. Step 2 deals with that.
+**Used in:** Note 10, Steps 3, 5, 6.
 
 ---
 
-# Step 1 — Rewrite the API unit properly
+# Phase 5 — Zombies, orphans, and PID 1
 
-### Split "what it is" from "how it's locked down"
+## 5.1 Zombies
 
-- `api.service` — what the service is and how it runs.
-- `api.service.d/10-hardening.conf` — the security settings from Note 8, kept separate so they're easy to review.
+A **zombie** is a process that has **already finished**, but whose parent hasn't called `wait()` yet. The kernel keeps a tiny entry (PID + exit code) so the parent can collect it.
 
 ```bash
-sudo mv /etc/systemd/system/api.service.d/override.conf \
-        /etc/systemd/system/api.service.d/10-hardening.conf
+ps -eo pid,ppid,stat,cmd | awk '$3 ~ /Z/'
+```
+```
+ 4410  3120 Z    [convert] <defunct>
 ```
 
-### The new base unit
+Facts:
+- A zombie uses **no CPU and no memory**, only a **PID slot**.
+- You **can't kill a zombie** — it's already dead. `kill -9` does nothing.
+- A few zombies briefly are normal. **Growing** numbers mean the **parent has a bug**: it starts children and never waits for them.
+- Too many can exhaust PIDs (`pid_max`) or the service's task limit (Note 13), and then nothing new can start.
 
-`/etc/systemd/system/api.service`:
+**Fix:** make the parent wait for its children (a code fix). Short-term: restart the **parent** — its zombies get adopted by PID 1, which reaps them immediately.
 
-```ini
-[Unit]
-Description=Team API
-Documentation=https://git.example.com/team/api
-After=network.target
+## 5.2 Orphans
 
-[Service]
-Type=exec
-User=api
-Group=api
-WorkingDirectory=/opt/api/current
-EnvironmentFile=/etc/myapps/common.env
-EnvironmentFile=/etc/myapps/api.env
-ExecStart=/usr/bin/node /opt/api/current/server.js
-Restart=on-failure
-RestartSec=1
+An **orphan** is a process whose **parent died first**. It keeps running. The kernel gives it a new parent:
 
-[Install]
-WantedBy=multi-user.target
+- PID 1 (systemd), or
+- the nearest **subreaper** — a process that asked to adopt orphans in its subtree (systemd's per-user manager does this).
+
+```bash
+ps -o pid,ppid,cmd -p <PID>       # PPID 1 = adopted
 ```
 
-What changed and why:
+Orphans are often **unintended leftovers**: you killed a script, but the long-running command it started is still going (Note 10, Step 3).
 
-| Line | Why |
+## 5.3 Why PID 1 is special
+
+| Duty | Why it matters |
 |---|---|
-| `Type=exec` | "Started" means node was actually executed. A missing binary now shows as a start failure. (Note 11, Phase 6) |
-| `Group=api` | Explicit, not left to defaults |
-| `WorkingDirectory=/opt/api/current` | Relative paths in the app resolve inside the current release. The symlink is resolved at each start, so after a deploy swap (Note 6, Step 3), a restart picks up the new release |
+| **Adopts orphans and reaps them** | Otherwise every orphan would become a permanent zombie when it ended |
+| **Ignores signals it hasn't asked to handle** | The kernel protects PID 1: a signal with a default "terminate" action is **not delivered** unless PID 1 has a handler. Even `SIGKILL` from inside its own container is ignored |
+| **If it dies, the system (or container) ends** | On a host: kernel panic. In a container: the container stops |
 
-(`After=` and `RestartSec=1` stay as they are for now. Steps 3 and 5 show why they need to change.)
+This is why containers need care (Note 1, Step 7):
+- If your app is PID 1 in a container and has no `SIGTERM` handler, `docker stop` is ignored until the 10-second SIGKILL.
+- If your app is PID 1 and starts child processes, **it must reap zombies** — a job normal apps never expect to do.
+- Fix both with a tiny init: `docker run --init` (uses `tini`) or `ENTRYPOINT ["tini", "--", ...]`.
 
-### Two settings promised in Note 10
-
-Add to `10-hardening.conf`:
-
-```ini
-[Service]
-# Note 10, Step 9: block running programs from places the API can write
-NoExecPaths=/dev/shm /tmp /var/tmp /srv/uploads /var/cache/api /var/lib/api
-# Note 10, Step 10: the API can't see other processes in /proc
-ProtectProc=invisible
-```
-
-- `NoExecPaths=` — even if an attacker writes a file into one of these folders, the service can't run it. The miner in Note 10, Step 9 ran from `/dev/shm`.
-- `ProtectProc=invisible` — inside this service, `/proc` shows only the service's own processes.
-
-(`MemoryDenyWriteExecute=` is another common hardening setting, but **Node's JIT compiler needs it off** — turning it on breaks Node.)
-
-### Check, load, apply
-
-```bash
-sudo systemd-analyze verify /etc/systemd/system/api.service
-sudo systemctl daemon-reload
-sudo systemctl restart api
-systemctl status api --no-pager | head -5
-```
-
-**Meaning:** `verify` reports unknown settings and typos before they cause a failed start. `daemon-reload` makes systemd read the new files. (Why: Note 11, Phase 3.4.)
-
-Test the new protections from inside the service's view:
-
-```bash
-sudo systemd-run --pipe --wait -p User=api -p ProtectProc=invisible ps aux | wc -l
-```
-
-A handful of lines (only its own processes), instead of 140+.
+**Used in:** Note 10, Steps 3, 5, 8.
 
 ---
 
-# Step 2 — The worker didn't come back after a reboot
+# Phase 6 — Signals
 
-After a planned reboot for kernel updates, uploads stop being processed.
+## 6.1 What a signal is
 
-```bash
-systemctl status worker
-```
-```
-○ worker.service - Worker
-     Loaded: loaded (/etc/systemd/system/worker.service; disabled; preset: enabled)
-     Active: inactive (dead)
-```
+A **signal** is a small numbered message sent to a process to tell it something happened: "please stop", "stop now", "the terminal closed", "pause".
 
-**Meaning:** `disabled` — nothing starts it at boot. Before the reboot it was running only because someone had used `systemctl start` after creating it, never `enable`. (Why: Note 11, Phase 5.3.)
+The process can react in one of three ways:
 
-### Fix
-
-```bash
-sudo systemctl enable --now worker
-```
-```
-Created symlink /etc/systemd/system/multi-user.target.wants/worker.service → /etc/systemd/system/worker.service.
-```
-
-**Meaning:** `enable` created the symlink that makes `multi-user.target` start it at boot; `--now` also starts it right away.
-
-### Related trap: units that can't be enabled
-
-Ruwan writes a small cleanup unit and tries to enable it:
-
-```bash
-sudo systemctl enable uploads-cleanup
-```
-```
-The unit files have no installation config (WantedBy=, RequiredBy=, UpheldBy=,
-Also=, or Alias= settings in the [Install] section, and DefaultInstance= for
-template units). This means they are not meant to be enabled or disabled ...
-```
-
-```bash
-systemctl is-enabled uploads-cleanup
-# static
-```
-
-**Meaning:** no `[Install]` section → `static` → can't be enabled. That's correct for a unit that's meant to be **started by something else** (a timer, Note 13–14). It's a bug only if you expected it to start at boot.
-
-**Rule:** after creating any unit, check **both** `is-active` and `is-enabled`.
-
----
-
-# Step 3 — The API logs errors at every boot
-
-After each reboot, the API works — but the logs show errors at startup.
-
-```bash
-journalctl -b -u api --no-pager | head -8
-```
-```
-09:00:04 systemd[1]: Started api.service - Team API.
-09:00:05 node[611]: Error: connect ENETUNREACH 10.0.0.5:5432
-09:00:05 systemd[1]: api.service: Main process exited, code=exited, status=1/FAILURE
-09:00:06 systemd[1]: api.service: Scheduled restart job, restart counter is at 1.
-09:00:06 node[690]: Error: connect ENETUNREACH 10.0.0.5:5432
-...
-09:00:09 node[722]: listening on :80
-```
-
-(`-b` means "this boot only".)
-
-**Meaning:** the API started before the network was ready, couldn't reach the database, crashed, and was restarted a few times until the network came up. It "worked" only because of `Restart=`.
-
-### Why — check the ordering
-
-```bash
-systemctl show api -p After -p Wants
-systemd-analyze critical-chain api.service
-```
-```
-After=network.target system.slice basic.target sysinit.target ...
-Wants=
-
-api.service @3.912s
-└─network.target @3.901s
-  └─systemd-networkd.service @3.402s +480ms
-    ...
-```
-
-```bash
-systemd-analyze critical-chain network-online.target
-```
-```
-network-online.target @7.215s
-└─systemd-networkd-wait-online.service @3.903s +3.310s
-```
-
-**Meaning:** the API is ordered after `network.target` (3.9 s), which only means "network management has started". The network is actually **up** at `network-online.target` (7.2 s). The API started ~3 seconds too early. (Why: Note 11, Phase 8.4.)
-
-### Fix
-
-In `api.service`:
-
-```ini
-[Unit]
-Wants=network-online.target
-After=network-online.target
-```
-
-Both lines: `Wants=` pulls the target into the boot, `After=` waits for it. (Why: Note 11, Phase 8.3.)
-
-```bash
-sudo systemctl daemon-reload
-```
-
-After the next reboot:
-
-```bash
-journalctl -b -u api --no-pager | head -3
-```
-```
-09:00:08 systemd[1]: Started api.service - Team API.
-09:00:09 node[640]: listening on :80
-```
-
-### Also fix it in the app
-
-Ordering only helps **at boot**. The database can restart at any time later. The API should **retry** its database connection with a delay instead of crashing — then systemd ordering is just a nice-to-have.
-
----
-
-# Step 4 — How should the worker relate to the API?
-
-The worker calls the API (`API_BASE_URL`, Note 2). A developer added this to `worker.service` "so the API is always there":
-
-```ini
-Requires=api.service
-After=api.service
-```
-
-### What it actually does
-
-During a deploy, CI restarts the API (Note 8, Step 2):
-
-```bash
-sudo systemctl restart api
-journalctl -u worker --since "1 min ago" --no-pager | grep -E 'Stopping|Started'
-```
-```
-16:05:02 systemd[1]: Stopping worker.service - Worker...
-16:05:04 systemd[1]: Started worker.service - Worker.
-```
-
-**Meaning:** `Requires=` means "if the API is stopped or restarted, stop/restart the worker too". Every API deploy now also restarts the worker, interrupting its jobs. (Why: Note 11, Phase 8.1.)
-
-### Decide what you really want
-
-| Want | Setting |
+| Reaction | Meaning |
 |---|---|
-| Starting the worker should also start the API | `Wants=api.service` |
-| If both start together, API goes first | `After=api.service` |
-| API restarts should **not** touch the worker | Not `Requires=` |
+| **Default action** | What the kernel does if the program didn't say otherwise (terminate, stop, ignore, or terminate + core dump) |
+| **Catch** | Run the program's own handler function (e.g. clean up, then exit) |
+| **Ignore** | Do nothing |
 
-The worker already retries API calls, so a brief API restart is fine. Use:
+Two signals **can't be caught or ignored**: `SIGKILL` and `SIGSTOP`. The kernel handles them directly.
 
-```ini
-Wants=api.service
-After=api.service
-```
+## 6.2 Signals you need to know
 
-### Group them: one target for the team's apps
+| Signal | No. | Default | Sent by / used for |
+|---|---|---|---|
+| `SIGHUP` | 1 | Terminate | Terminal/SSH closed; by convention, "**reload config**" for daemons (e.g. nginx) |
+| `SIGINT` | 2 | Terminate | **Ctrl+C** in a terminal |
+| `SIGQUIT` | 3 | Terminate + core dump | **Ctrl+\\** |
+| `SIGKILL` | 9 | Terminate | "Die **now**" — can't be caught, no cleanup |
+| `SIGUSR1` / `SIGUSR2` | 10 / 12 | Terminate | Program-defined (e.g. reopen log files) |
+| `SIGSEGV` | 11 | Terminate + core | Program bug: bad memory access |
+| `SIGPIPE` | 13 | Terminate | Writing to a pipe/socket nobody reads (`cmd \| head`) |
+| `SIGTERM` | 15 | Terminate | "**Please stop**" — the normal, polite stop (`kill`, `systemctl stop`, `docker stop`) |
+| `SIGCHLD` | 17 | Ignore | Sent to a parent when a child ends |
+| `SIGCONT` | 18 | Continue | Resume a stopped process |
+| `SIGSTOP` | 19 | Stop | Pause — can't be caught |
+| `SIGTSTP` | 20 | Stop | **Ctrl+Z** (can be caught) |
 
-Ops often want "restart all our apps" as one action. Create a target:
-
-`/etc/systemd/system/myapps.target`:
-
-```ini
-[Unit]
-Description=Team applications
-
-[Install]
-WantedBy=multi-user.target
-```
-
-In **both** `api.service` and `worker.service`:
-
-```ini
-[Unit]
-PartOf=myapps.target
-
-[Install]
-WantedBy=myapps.target
-```
-
-- `PartOf=myapps.target` — stopping or restarting the target does the same to the service.
-- `WantedBy=myapps.target` — enabling the service links it into the target, and the target is linked into `multi-user.target`.
-
-Because `[Install]` changed, re-run enable so the symlinks move:
+(Numbers are for Linux on x86/ARM. Use names in commands — they're the same everywhere.)
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl reenable api worker
-sudo systemctl enable myapps.target
-systemctl list-dependencies myapps.target
-```
-```
-myapps.target
-● ├─api.service
-● └─worker.service
+kill -l          # list all signals
 ```
 
-Now:
+## 6.3 SIGTERM vs SIGKILL — the most important pair
+
+| | `SIGTERM` (15) | `SIGKILL` (9) |
+|---|---|---|
+| Meaning | "Please stop" | "Stop now" |
+| Program can react | Yes: finish work, save, close connections, delete temp files | **No** — killed by the kernel instantly |
+| Result | Clean shutdown (if the program handles it) | Half-written files, lost in-progress work, leftover temp files and locks |
+| Use | **Always first** | Only if SIGTERM didn't work after a reasonable wait |
+
+The right sequence, which systemd and Docker both follow: **SIGTERM → wait → SIGKILL** (Note 11 shows systemd's version).
+
+## 6.4 Sending signals
 
 ```bash
-sudo systemctl restart myapps.target     # restarts both
+kill 2890               # SIGTERM (the default)
+kill -TERM 2890         # same, explicit
+kill -9 2890            # SIGKILL
+kill -HUP 2890          # reload
+kill -STOP 2890 / kill -CONT 2890   # pause / resume
+
+pkill -TERM -u worker python    # by name and user
+pkill -f 'server.js'            # by full command line
+killall node                    # every process named exactly "node" (careful)
+
+kill -0 2890 && echo alive      # signal 0: sends nothing, just checks it exists and you're allowed
 ```
 
-**Update the sudo rules (Note 8):** ops can be given `/usr/bin/systemctl restart myapps.target` instead of listing every service. Keep exact commands — no wildcards. (Why: Note 7, Phase 6.1.)
+Sending to a **process group** (Phase 7) — the leading `-` means "group":
+
+```bash
+kill -TERM -- -3120     # every process in group 3120
+```
+
+## 6.5 Who can signal whom
+
+- You can signal **your own** processes.
+- **Root** (or `CAP_KILL`, Note 7) can signal any process.
+- Otherwise: `kill: (2890) - Operation not permitted`.
+
+So a developer can't stop the `api` service by hand — they'd need a sudo rule (Note 8).
+
+**Used in:** Note 10, Steps 2, 3, 4, 9.
 
 ---
 
-# Step 5 — A crash loop that left the API down for two hours
+# Phase 7 — Terminals, sessions, and jobs
 
-A deploy ships a release that's missing a required env variable. The API exits with code 1 immediately. Two hours later, a customer reports the site is down.
+## 7.1 Sessions and process groups
 
-```bash
-systemctl status api
-```
-```
-× api.service - Team API
-     Active: failed (Result: exit-code) since Tue 2026-10-20 14:02:11 +0530; 2h 3min ago
-   Main PID: 9012 (code=exited, status=1/FAILURE)
+When you log in, your shell starts a **session**. Every command line you run becomes a **process group** (a pipeline like `cat f | grep x` is one group with two processes).
 
-14:02:10 node[9012]: Error: SESSION_SECRET is not set
-14:02:11 systemd[1]: api.service: Scheduled restart job, restart counter is at 5.
-14:02:11 systemd[1]: api.service: Start request repeated too quickly.
-14:02:11 systemd[1]: api.service: Failed with result 'exit-code'.
-```
-
-**Meaning:**
-- `Restart=on-failure` restarted it, but with `RestartSec=1` there were 5 starts within 10 seconds.
-- That hit the default **start limit** (5 starts per 10 s), so systemd **gave up** and marked it `failed`.
-- Nothing told anyone. (Why: Note 11, Phase 9.2.)
-
-### Restore service now
-
-Roll back to the previous release (Note 6, Step 3), then clear the failed state:
+- One group at a time is in the **foreground** — it gets your keyboard input and keyboard signals.
+- Others are in the **background**.
 
 ```bash
-sudo -u deploy bash -c 'ln -s /opt/api/releases/2026-10-17-2 /opt/api/current.new && mv -T /opt/api/current.new /opt/api/current'
-sudo systemctl reset-failed api
-sudo systemctl start api
+ps -o pid,pgid,sid,stat,cmd --forest -t $(tty)
 ```
 
-### Decide a restart policy
+## 7.2 Keyboard signals
 
-Two different situations need two answers:
-- A **bad release** fails forever — retrying won't fix it; a person must act.
-- A **temporary problem** (database restarting) fixes itself — keep retrying, but slowly.
+| Keys | Signal | Sent to |
+|---|---|---|
+| `Ctrl+C` | `SIGINT` | Every process in the **foreground group** |
+| `Ctrl+\` | `SIGQUIT` | Foreground group |
+| `Ctrl+Z` | `SIGTSTP` | Foreground group (pauses it) |
 
-Policy: retry with growing waits, and if it still can't stay up after ~10 minutes, stop and **alert**.
+## 7.3 Job control
 
-In `api.service`:
+The shell calls each process group a **job**.
 
-```ini
-[Unit]
-StartLimitIntervalSec=10min
-StartLimitBurst=10
-OnFailure=notify-failure@%n.service
-
-[Service]
-Restart=on-failure
-RestartSec=2
-RestartSteps=5
-RestartMaxDelaySec=60
+```bash
+./reindex.sh &          # start in the background → [1] 5120
+jobs -l                 # list jobs: [1]+ 5120 Running ./reindex.sh &
+fg %1                   # bring job 1 to the foreground
+# Ctrl+Z                → [1]+ Stopped ./reindex.sh
+bg %1                   # continue it in the background
+kill %1                 # SIGTERM to job 1
 ```
 
-- Waits grow from 2 s to 60 s (systemd 254+; check `systemctl --version`). (Why: Note 11, Phase 9.3.)
-- 10 starts in 10 minutes → give up → `failed` → `OnFailure=` starts the alert unit. (Why: Note 11, Phase 9.4.)
+A background job that tries to **read** from the terminal gets stopped automatically.
 
-### The alert unit — a template
+## 7.4 What happens when the terminal closes
 
-`/etc/systemd/system/notify-failure@.service`:
+When your SSH connection drops or you close the window:
 
-```ini
-[Unit]
-Description=Send alert: %i failed
+1. The terminal sends `SIGHUP` ("hang up") to your shell.
+2. Bash then sends `SIGHUP` to **all its jobs**, running and stopped.
+3. Their default action: **terminate**.
 
-[Service]
-Type=oneshot
-DynamicUser=yes
-SupplementaryGroups=systemd-journal
-EnvironmentFile=/etc/myapps/alerts.env
-ExecStart=/usr/local/bin/notify-failure %i
+So a long job started in an SSH session **dies when your laptop sleeps or the Wi-Fi drops**. Even if it ignored SIGHUP, its stdout/stderr point at a terminal that no longer exists, and the next write can kill it with `SIGPIPE` / an error.
+
+## 7.5 Keeping a job alive after logout
+
+| Method | How | Good for | Downside |
+|---|---|---|---|
+| `nohup cmd &` | Ignore SIGHUP; output to `nohup.out` | Quick one-offs | No easy way to come back to it |
+| `cmd &` then `disown` | Remove the job from the shell's list, so the shell won't SIGHUP it | Forgot to use nohup | Output still goes to the dead terminal — redirect it |
+| `setsid cmd` | Start in a brand-new session, no terminal | Detached background work | Same |
+| **`tmux` / `screen`** | Run inside a session that stays on the server; detach and reattach later | **Interactive work** you want to come back to | Must remember to start tmux first |
+| **`systemd-run`** | Run as a temporary systemd unit, with logs in the journal | **Real jobs** (migrations, reindexes) | Covered properly in Notes 11–13 |
+
+```bash
+nohup ./reindex.sh > /tmp/reindex.log 2>&1 &
+tmux new -s reindex          # then run the job; Ctrl+b d to detach; tmux attach -t reindex
+sudo systemd-run --unit=reindex --uid=worker /opt/worker/reindex.sh
+journalctl -u reindex -f     # follow its output
 ```
 
-- `%i` is the instance name — here, the failed unit's name (`api.service`), passed in by `OnFailure=notify-failure@%n.service`. (Why: Note 11, Phase 12.)
-- `DynamicUser=yes` — runs as a temporary user, not root. `systemd-journal` group lets it read the logs. (Why: Note 7, Phase 10.1.)
-- `alerts.env` holds `ALERT_WEBHOOK_URL=...` (`600 root:root` — systemd reads it as root, Note 6, Step 4).
+> **How this goes wrong:** attackers use the same tools (`nohup`, `setsid`, `disown`) to keep a backdoor running after they disconnect. A long-running process with **PPID 1**, no terminal, running from `/tmp` or `/dev/shm`, is a classic sign.
 
-`/usr/local/bin/notify-failure` (`755 root:root`):
+**Used in:** Note 10, Step 2.
+
+---
+
+# Phase 8 — Handling signals: graceful shutdown
+
+## 8.1 The graceful shutdown pattern
+
+When a service gets `SIGTERM`, a well-behaved one:
+
+1. **Stops accepting** new work (close the listening socket, stop pulling from the queue).
+2. **Finishes in-flight work** (current requests, the current job).
+3. **Cleans up** (flush logs, close DB connections, remove temp files and locks).
+4. **Exits** with code 0 — **before** the stop timeout, or it will be SIGKILLed anyway.
+
+## 8.2 In Node.js
+
+```js
+const server = app.listen(port);
+
+process.on('SIGTERM', () => {
+  console.log('SIGTERM: stopping');
+  server.close(() => {              // stop new connections, wait for open ones
+    db.end().then(() => process.exit(0));
+  });
+  setTimeout(() => process.exit(1), 25000).unref();   // safety net: don't hang forever
+});
+```
+
+Without a handler, Node's default for `SIGTERM` is to **exit immediately**, dropping open requests.
+
+## 8.3 In Python
+
+```python
+import signal
+
+stopping = False
+
+def on_term(signum, frame):
+    global stopping
+    stopping = True          # just set a flag; the main loop checks it
+
+signal.signal(signal.SIGTERM, on_term)
+
+while not stopping:
+    job = queue.get(timeout=5)
+    if job:
+        process(job)         # current job always finishes
+# loop ended → clean up and exit normally
+```
+
+Keep the handler **tiny** (set a flag). Do the real work in the main loop.
+
+## 8.4 In shell scripts: `trap`
+
+`trap` runs a command when the script gets a signal or exits:
 
 ```bash
 #!/bin/bash
-set -euo pipefail
-unit="$1"
-text="$(hostname): ${unit} FAILED
-$(journalctl -u "$unit" -n 15 --no-pager -o short-iso)"
-curl -fsS -X POST -H 'Content-Type: application/json' \
-     --data "$(jq -n --arg t "$text" '{text: $t}')" \
-     "$ALERT_WEBHOOK_URL"
+tmp=$(mktemp)
+
+cleanup() {
+  rm -f "$tmp"
+}
+trap cleanup EXIT              # always runs when the script exits, for any reason
+trap 'exit 143' TERM           # on SIGTERM, exit (which then triggers the EXIT trap)
+trap 'exit 130' INT            # on Ctrl+C
 ```
 
-(Needs `jq`: `sudo apt install jq`. The webhook can be Slack, Google Chat, or similar.)
+`EXIT` is the most useful trap: it runs on normal exit, on error (`set -e`), and after the TERM/INT traps call `exit`.
 
-### Test the alert without breaking anything
+## 8.5 Two shell traps that catch people
+
+**1. A trap waits for the foreground command to finish.**
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl start notify-failure@api.service
-journalctl -u notify-failure@api.service -n 5 --no-pager
+trap 'echo got TERM; exit 143' TERM
+pg_dump ... > dump.sql        # runs 20 minutes in the foreground
 ```
 
-The team channel gets the message with the last 15 log lines. Add the same `OnFailure=` line to `worker.service`.
+If you send `SIGTERM` to the script, bash notes it but **runs the trap only after `pg_dump` finishes** — 20 minutes later. Fix: run the command in the background and `wait`; `wait` is interrupted by signals immediately:
 
-**Conclusion:** a broken release now produces an alert within ~10 minutes instead of silent downtime, and temporary problems retry slowly instead of hammering the database.
+```bash
+pg_dump ... > dump.sql &
+child=$!
+trap 'kill -TERM $child 2>/dev/null; exit 143' TERM
+wait $child
+```
+
+**2. Killing a script doesn't kill what it started.**
+
+`kill <script PID>` signals only the bash process. Its children (e.g. `pg_dump`) keep running as **orphans** (Phase 5.2). Either forward the signal to the child (as above), or signal the whole **process group**:
+
+```bash
+kill -TERM -- -<PGID>         # the script and everything it started
+```
+
+## 8.6 Limiting run time: `timeout`
+
+```bash
+timeout 30m ./reindex.sh              # SIGTERM after 30 minutes
+timeout -k 1m 30m ./reindex.sh        # ...and SIGKILL 1 minute later if still running
+echo $?                               # 124 if it timed out
+```
+
+**Used in:** Note 10, Steps 3, 4.
 
 ---
 
-# Step 6 — Restarts that still kill the worker's jobs
+# Phase 9 — Priority: `nice` and `ionice`
 
-Note 10, Step 4 added a graceful `SIGTERM` handler. But some thumbnail jobs take up to 3 minutes, and those still fail during deploys.
+## 9.1 Nice values
 
-```bash
-journalctl -u worker --since "15:00" --no-pager | grep -v 'processing'
-```
-```
-15:10:00 worker[7410]: SIGTERM received: finishing current job, then exiting
-15:10:00 worker[7410]: convert failed: killed by signal 15
-15:11:30 systemd[1]: worker.service: State 'stop-sigterm' timed out. Killing.
-15:11:30 systemd[1]: worker.service: Killing process 7410 (python) with signal SIGKILL.
-15:11:30 systemd[1]: worker.service: Main process exited, code=killed, status=9/KILL
-15:11:30 systemd[1]: worker.service: Failed with result 'timeout'.
-```
+When more processes want CPU than there are cores, the kernel's scheduler decides who runs. The **nice value** is a hint:
 
-Two separate problems:
-
-**1. `convert failed: killed by signal 15`** — the child process got `SIGTERM` at the same moment as the worker. The default `KillMode=control-group` signals **every** process in the service at once. The worker wanted to let its current `convert` finish, but the converter was already killed. (Why: Note 11, Phase 10.3.)
-
-**2. `stop-sigterm timed out` after 90 s** — the default `TimeoutStopSec=90` is shorter than the longest job. (Why: Note 11, Phase 10.2.)
-
-### Fix
-
-In `worker.service`:
-
-```ini
-[Service]
-KillMode=mixed
-TimeoutStopSec=5min
-```
-
-- `KillMode=mixed` — `SIGTERM` goes **only to the main worker process**. It finishes its current job (including the converter), then exits. If the timeout still hits, `SIGKILL` goes to everything left.
-- `TimeoutStopSec=5min` — longer than the longest job, with margin.
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl restart worker
-journalctl -u worker -n 4 --no-pager
-```
-```
-15:30:01 worker[8120]: SIGTERM received: finishing current job, then exiting
-15:32:14 worker[8120]: done img-0213.png
-15:32:14 worker[8120]: worker stopped cleanly
-15:32:15 systemd[1]: Started worker.service - Worker.
-```
-
-**Trade-off:** a longer stop timeout means deploys and shutdowns can take up to 5 minutes. That's the cost of not losing work. Keep jobs short where possible.
-
----
-
-# Step 7 — Changing a package's service (nginx) safely
-
-nginx (from apt) needs three changes:
-1. Restart automatically if it crashes (the package unit doesn't).
-2. Allow more open files (lots of connections). (Resource limits in detail: Note 13.)
-3. Use the team's config file `/etc/nginx/team.conf` instead of the default.
-
-### Never edit the package file
-
-```bash
-systemctl cat nginx | head -2
-# # /usr/lib/systemd/system/nginx.service
-```
-
-That file is replaced on every nginx upgrade. Use a drop-in. (Why: Note 11, Phase 3.2 and 13.)
-
-### First attempt
-
-```bash
-sudo systemctl edit nginx
-```
-
-```ini
-[Service]
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=65535
-ExecStart=/usr/sbin/nginx -c /etc/nginx/team.conf -g 'daemon on; master_process on;'
-```
-
-Save (systemctl edit reloads automatically) and restart:
-
-```bash
-sudo systemctl restart nginx
-```
-```
-Failed to restart nginx.service: Unit nginx.service has a bad unit file setting.
-```
-```bash
-journalctl -u nginx -n 2 --no-pager
-```
-```
-nginx.service: Service has more than one ExecStart= setting, which is only allowed for Type=oneshot services. Refusing.
-```
-
-**Meaning:** `ExecStart=` is a **list**. The drop-in **added** a second command instead of replacing the first. (Why: Note 11, Phase 13.3.)
-
-### Look at everything that runs nginx
-
-```bash
-systemctl cat nginx | grep -E '^Exec'
-```
-```
-ExecStartPre=/usr/sbin/nginx -t -q -g 'daemon on; master_process on;'
-ExecStart=/usr/sbin/nginx -g 'daemon on; master_process on;'
-ExecReload=/usr/sbin/nginx -g 'daemon on; master_process on;' -s reload
-ExecStop=-/sbin/start-stop-daemon --quiet --stop --retry QUIT/5 --pidfile /run/nginx.pid
-```
-
-**Meaning:** three lines start nginx with the default config: the config **test** (`ExecStartPre`), the **start**, and the **reload**. Changing only `ExecStart` would test and reload the wrong config.
-
-### Fixed drop-in
-
-```ini
-[Service]
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=65535
-
-ExecStartPre=
-ExecStartPre=/usr/sbin/nginx -t -q -c /etc/nginx/team.conf -g 'daemon on; master_process on;'
-ExecStart=
-ExecStart=/usr/sbin/nginx -c /etc/nginx/team.conf -g 'daemon on; master_process on;'
-ExecReload=
-ExecReload=/usr/sbin/nginx -c /etc/nginx/team.conf -g 'daemon on; master_process on;' -s reload
-```
-
-Each empty `Key=` clears the package's value first.
-
-```bash
-sudo systemctl restart nginx
-systemctl status nginx --no-pager | head -6
-systemd-delta --type=extended
-```
-```
-     Drop-In: /etc/systemd/system/nginx.service.d
-             └─override.conf
-     Active: active (running) ...
-
-[EXTENDED]   /usr/lib/systemd/system/nginx.service → /etc/systemd/system/nginx.service.d/override.conf
-[EXTENDED]   /etc/systemd/system/api.service → /etc/systemd/system/api.service.d/10-hardening.conf
-```
-
-**Meaning:** nginx runs with the team config; `systemd-delta` lists every unit you've extended, so nothing is hidden. Future nginx upgrades keep the drop-in.
-
-**Lesson:** when you change **how a program starts**, check **every** `Exec*` line that runs it.
-
----
-
-# Step 8 — Three workers from one file
-
-The upload queue is growing. The team wants three workers.
-
-### Convert the worker to a template
-
-```bash
-sudo systemctl disable --now worker
-sudo mv /etc/systemd/system/worker.service /etc/systemd/system/worker@.service
-sudo mv /etc/systemd/system/worker.service.d /etc/systemd/system/worker@.service.d
-```
-
-Edit `/etc/systemd/system/worker@.service`:
-
-```ini
-[Unit]
-Description=Worker %i
-Wants=api.service
-After=api.service
-PartOf=myapps.target
-OnFailure=notify-failure@%n.service
-
-[Service]
-Type=exec
-User=worker
-Group=worker
-WorkingDirectory=/var/lib/worker
-EnvironmentFile=/etc/myapps/common.env
-EnvironmentFile=/etc/myapps/worker.env
-Environment=WORKER_ID=%i
-ExecStart=/opt/worker/venv/bin/python -m worker
-Restart=on-failure
-RestartSec=2
-KillMode=mixed
-TimeoutStopSec=5min
-
-[Install]
-WantedBy=myapps.target
-```
-
-`%i` becomes `1`, `2`, `3`. `WORKER_ID` lets each instance name itself in logs. (Why: Note 11, Phase 12.)
-
-The `StateDirectory=worker` from Note 8's hardening is shared by all instances — they all use `/var/lib/worker`, which is fine because they only read config there. If each needed its own folder, use `StateDirectory=worker/%i`.
-
-### Start them
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now worker@1 worker@2 worker@3
-systemctl list-units 'worker@*' --no-pager
-```
-```
-UNIT              LOAD   ACTIVE SUB     DESCRIPTION
-worker@1.service  loaded active running Worker 1
-worker@2.service  loaded active running Worker 2
-worker@3.service  loaded active running Worker 3
-```
-
-Each is its own service:
-
-```bash
-journalctl -u worker@2 -n 3 --no-pager
-sudo systemctl restart worker@2          # only that one
-sudo systemctl restart myapps.target     # api + all three workers
-```
-
-### Update anything that named `worker.service`
-
-- Note 8's sudo rules (`systemctl restart worker`) → replace with `restart myapps.target` or the exact instance names. **Don't** use `worker@*` — a wildcard in sudo is wider than it looks. (Why: Note 7, Phase 6.1.)
-- Note 10's `systemd-run` reindex used `worker`'s env files — unchanged.
-- Monitoring and scripts that check `systemctl is-active worker` → check `worker@1 worker@2 worker@3`, or the target.
-
----
-
-# Step 9 — A developer's own service, without sudo
-
-Nimal wants his thumbnail tool's file watcher (`/srv/projects/thumbs-tool/watch.py`) running continuously while he develops it. He has no sudo for this — and shouldn't need it.
-
-### A user service
-
-As nimal, `~/.config/systemd/user/thumbs-watch.service`:
-
-```ini
-[Unit]
-Description=Thumbnail tool watcher (dev)
-
-[Service]
-Type=exec
-WorkingDirectory=/srv/projects/thumbs-tool
-ExecStart=/usr/bin/python3 /srv/projects/thumbs-tool/watch.py
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=default.target
-```
-
-```bash
-systemctl --user daemon-reload
-systemctl --user enable --now thumbs-watch
-systemctl --user status thumbs-watch
-journalctl --user -u thumbs-watch -f
-```
-
-**Meaning:** runs as nimal, managed by **his own** systemd manager, no sudo. `default.target` is the user manager's normal target. (Why: Note 11, Phase 14.1.)
-
-### Problem: it stops when he logs out
-
-Next morning it's not running. It stopped at about the time his last SSH session ended.
-
-**Meaning:** a user's systemd manager runs only while they have a session. When the last session ends, it stops their services.
-
-### Decision: lingering
-
-The admin can let it keep running:
-
-```bash
-sudo loginctl enable-linger nimal
-ls /var/lib/systemd/linger/
-# nimal
-```
-
-Now his user manager starts at boot and runs without a login.
-
-**Decide on purpose.** Lingering means a user can keep processes running permanently, starting at boot, without anyone logged in. That's useful for developers — and also a classic **persistence** method for attackers (Note 11, "How this goes wrong"). Allow it per person, record why, and include `/var/lib/systemd/linger/` in the audit (Step 11).
-
----
-
-# Step 10 — Boot got two minutes slower
-
-After Step 3 (waiting for `network-online.target`), a reboot takes more than two minutes before the API answers.
-
-```bash
-systemd-analyze
-systemd-analyze blame | head -3
-```
-```
-Startup finished in 2.1s (kernel) + 2min 4.3s (userspace) = 2min 6.4s
-
-2min 0.112s systemd-networkd-wait-online.service
-     1.420s cloud-init.service
-      812ms snapd.service
-```
-
-**Meaning:** `systemd-networkd-wait-online` waited **two minutes** (its default timeout). Before Step 3, nothing waited for it, so the problem was hidden. (Why: Note 11, Phase 1.3.)
-
-### What is it waiting for?
-
-```bash
-networkctl list
-```
-```
-IDX LINK  TYPE     OPERATIONAL  SETUP
-  1 lo    loopback carrier      unmanaged
-  2 ens4  ether    routable     configured
-  3 ens5  ether    no-carrier   configuring
-```
-
-**Meaning:** `ens5` — a second network card added for a test last month — has no connection, so it never becomes "configured". By default, wait-online waits for **every** managed interface.
-
-### Fix
-
-Tell netplan that interface isn't required for "online". In `/etc/netplan/60-ens5.yaml`:
-
-```yaml
-network:
-  version: 2
-  ethernets:
-    ens5:
-      dhcp4: true
-      optional: true
-```
-
-```bash
-sudo netplan apply
-```
-
-(Or remove `ens5` if it's no longer needed.)
-
-Next boot:
-
-```bash
-systemd-analyze
-```
-```
-Startup finished in 2.1s (kernel) + 15.2s (userspace) = 17.3s
-```
-
-**Conclusion:** adding a correct dependency can expose a slow unit that was always there. `systemd-analyze blame` and `critical-chain` find it quickly.
-
----
-
-# Step 11 — Audit the units
-
-Unit files decide what root starts, as whom. Add these checks to the Note 8 audit script.
-
-```bash
-echo "=== Unit files or drop-ins writable by non-root (expect: none) ==="
-sudo find /etc/systemd /usr/lib/systemd /run/systemd -type f \
-     \( -name '*.service' -o -name '*.target' -o -name '*.timer' -o -name '*.conf' \) \
-     -perm /022 2>/dev/null
-
-echo "=== Programs started by running services, and who can change them ==="
-for u in $(systemctl list-units --type=service --state=running --no-legend | awk '{print $1}'); do
-  systemctl show "$u" -p ExecStart --value | grep -o 'path=[^ ;]*' | cut -d= -f2
-done | sort -u | xargs -r stat -c '%U:%G %a %n'
-# expect root-owned, not group/other-writable. Also check scripts passed as arguments.
-
-echo "=== Services running as root ==="
-for u in $(systemctl list-units --type=service --state=running --no-legend | awk '{print $1}'); do
-  user=$(systemctl show "$u" -p User --value)
-  [ -z "$user" ] && echo "root  $u"
-done
-
-echo "=== Overridden / extended units (expect: only ones we made) ==="
-systemd-delta --type=extended,overridden --no-pager
-
-echo "=== Masked units (expect: none important) ==="
-systemctl list-unit-files --state=masked --no-pager --no-legend
-
-echo "=== Users with lingering services ==="
-ls /var/lib/systemd/linger/ 2>/dev/null
-
-echo "=== Failed units ==="
-systemctl list-units --failed --no-legend
-```
-
-### Reading it
-
-| Check | Investigate if… |
+| Nice | Meaning |
 |---|---|
-| Writable unit files | Any result — someone could choose what root runs |
-| ExecStart programs | Not `root`-owned, or mode allows group/other write |
-| Services as root | An app service appears (should have `User=`) |
-| `systemd-delta` | A drop-in you didn't create — e.g. an extra `ExecStartPre=` on a normal service |
-| Masked units | A security service (logging, firewall) blocked |
-| Lingering | A user not on the approved list |
-| Failed units | Anything — and why its alert didn't fire |
+| `-20` | Highest priority ("not nice" to others) |
+| `0` | Default |
+| `19` | Lowest priority ("very nice": gives way to others) |
 
----
+`top` shows it as `NI`, and `PR` (= 20 + NI for normal processes).
 
-# State of the server after Note 12
+Nice only matters **when the CPU is busy**. On an idle server, a nice-19 process still gets all the CPU it wants.
 
-### Units
-
-| Unit | Purpose |
-|---|---|
-| `myapps.target` | Groups the team's apps; enabled in `multi-user.target` |
-| `api.service` + `10-hardening.conf` | API; waits for network; backoff restarts; alerts on failure |
-| `worker@1..3.service` + hardening drop-in | Three workers; graceful stop up to 5 min |
-| `notify-failure@.service` | Sends an alert with recent logs for any failed unit |
-| `nginx.service` + `override.conf` | Package unit with restart, file limit, team config |
-| `thumbs-watch.service` (nimal, user) | Dev tool; lingering approved |
-
-### Final `api.service`
-
-```ini
-[Unit]
-Description=Team API
-Documentation=https://git.example.com/team/api
-Wants=network-online.target
-After=network-online.target
-PartOf=myapps.target
-StartLimitIntervalSec=10min
-StartLimitBurst=10
-OnFailure=notify-failure@%n.service
-
-[Service]
-Type=exec
-User=api
-Group=api
-WorkingDirectory=/opt/api/current
-EnvironmentFile=/etc/myapps/common.env
-EnvironmentFile=/etc/myapps/api.env
-ExecStart=/usr/bin/node /opt/api/current/server.js
-Restart=on-failure
-RestartSec=2
-RestartSteps=5
-RestartMaxDelaySec=60
-
-[Install]
-WantedBy=myapps.target
+```bash
+nice -n 10 ./backup.sh           # start with lower priority
+renice -n 15 -p 5120             # change a running process
+ps -o pid,ni,cmd -p 5120         # check
 ```
 
-**Still open for Note 14:**
-- Logs: where they're kept, how long, and how to search them well.
-- The backup still runs from cron — moving it to a systemd timer.
-- No CPU or memory limits yet — a runaway worker can starve the API.
+Rules:
+- Normal users can only make their processes **nicer** (raise the number), never less nice.
+- Lowering the number (higher priority) needs root.
+
+## 9.2 Disk priority: `ionice`
+
+Nice affects **CPU** only. A backup can hog the **disk** instead. `ionice` sets disk priority:
+
+| Class | Meaning |
+|---|---|
+| `-c 1` (realtime) | Always first (root only, dangerous) |
+| `-c 2 -n 0..7` (best-effort) | Normal, with levels (0 = highest) |
+| `-c 3` (idle) | Only gets the disk when nobody else wants it |
+
+```bash
+ionice -c 3 nice -n 10 ./backup.sh     # low CPU and idle disk priority
+```
+
+How much effect `ionice` has depends on the disk scheduler and storage type; on some cloud disks it's limited. For hard limits, use cgroups (Note 13).
+
+**Used in:** Note 10, Step 7.
 
 ---
 
-# Scenario recap
+# Phase 10 — Stuck processes: the `D` state
 
-| Step | What happened | Concept (Note 11) |
+## 10.1 What `D` means
+
+`D` (uninterruptible sleep) means the process is **inside the kernel**, waiting for something that must not be interrupted half-way — almost always **storage I/O**: a slow or failing disk, a hung network filesystem (NFS, `gcsfuse` buckets), or a stuck device.
+
+## 10.2 Why `kill -9` doesn't work
+
+Signals are delivered when a process returns from the kernel to its own code. A process in `D` hasn't returned, so **even SIGKILL waits** until the I/O finishes or fails. If the I/O never completes, the process stays forever — sometimes until reboot.
+
+Some kernel waits are marked "killable": they also show as `D`, but do react to `SIGKILL`. Many are not. So the practical rule is: **if a process is still in `D` after `kill -9`, the cause is underneath it, and killing won't help.**
+
+## 10.3 Finding out what it's waiting for
+
+```bash
+ps -eo pid,stat,wchan:32,cmd | awk '$2 ~ /D/'
+```
+```
+ 6012 D    folio_wait_bit_common    python -m worker.thumbs
+```
+
+`wchan` is the kernel function it's waiting in — a clue to the layer (here, waiting for a page of file data to be read from storage). Root can see more:
+
+```bash
+sudo cat /proc/6012/stack
+```
+
+The fix is **the thing it's waiting on**: the storage, mount, or network. Processes in `D` also count in the **load average**, so a hung mount can show high load with an idle CPU (resources area).
+
+**Used in:** Note 10, Step 6.
+
+---
+
+# How this goes wrong — overview
+
+For the security track: what normal process behaviour looks like when someone abuses it.
+
+| Issue | Why it matters | How to check |
 |---|---|---|
-| 0 | Read status and the combined unit | `status`, `cat`, `is-enabled` (3, 5) |
-| 1 | Rewrote the API unit; split hardening into a drop-in | `Type=exec`, `WorkingDirectory`, `verify`, `daemon-reload` (3, 4, 6, 7) |
-| 2 | Worker missing after reboot; a "static" unit | `start` vs `enable`; `[Install]` (5) |
-| 3 | API started before the network | `network-online.target`, `Wants=` + `After=` (8) |
-| 4 | API restarts also restarted the worker | `Requires=` vs `Wants=`; `PartOf=` + target (8, 11) |
-| 5 | Crash loop → silent `failed` | Start limit, backoff, `OnFailure=` template alert (9, 12) |
-| 6 | Long jobs killed on stop | `KillMode=mixed`, `TimeoutStopSec=` (10) |
-| 7 | nginx drop-in refused | Clearing list settings; check every `Exec*` (13) |
-| 8 | Three workers from one file | Templates, `%i`, instances (12) |
-| 9 | Dev service without sudo | User services, lingering (14) |
-| 10 | Boot 2 min slower | `systemd-analyze blame`, wait-online (1) |
-| 11 | Unit audit | Security overview |
+| Secrets in command lines | Any user can read every process's arguments with `ps` (Note 2) | `ps -eo user,cmd`; look for `-p`, `--password`, tokens |
+| `/proc` visible to everyone | Users can see all processes and arguments | Mount `/proc` with `hidepid=invisible` (Note 10, Step 10) |
+| Disguised process names | `argv[0]` can be anything: a backdoor named `[kworker/0:2]` or `sshd` | Real kernel threads have **PPID 2** and **no `exe` link**; compare `/proc/PID/exe` with the name |
+| Deleted executables | Malware deletes its file after starting | `ls -l /proc/*/exe 2>/dev/null \| grep deleted` |
+| Running from writable/temp places | Dropped tools often run from `/tmp`, `/dev/shm`, `/var/tmp` | `/proc/PID/exe` and `/proc/PID/cwd` |
+| Detached long-running processes | `nohup`/`setsid` backdoors survive logout | PPID 1, no TTY, odd user, unexpected network connections (`ss -tnp`) |
+| Unexpected network listeners | Bind shells, miners' pools | `sudo ss -tulpn`, `sudo ss -tnp` |
+| High CPU from an unknown process | Crypto miners | `top`, then the checks above |
+| Fork bombs | Create processes until the system can't start any more | Prevent with task limits (Note 13) |
+| Killing others' processes | Normally `Operation not permitted`; only root/`CAP_KILL` | Who has `CAP_KILL` or broad sudo (Note 7) |
+
+When investigating a suspicious process, **collect evidence before killing it** — its file, command line, environment, open files, and connections disappear when it dies (Note 10, Step 9).
 
 ---
 
-# Troubleshooting table
+# Summary table
 
-| Symptom | Likely cause | Check | Fix |
-|---|---|---|---|
-| Edited a unit, nothing changed | No `daemon-reload` / no restart | `systemctl status` warning | `daemon-reload`, then restart |
-| Service behaves differently from its file | A drop-in overrides it | `systemctl cat UNIT` | Edit or remove the drop-in |
-| Service not running after reboot | Started but never enabled | `systemctl is-enabled` | `enable --now` |
-| `enable` says "no installation config" | No `[Install]` section (`static`) | `systemctl is-enabled` | Add `[Install]`, or start it from another unit |
-| Errors at boot, works later | Started before network/DB | `journalctl -b -u UNIT`, `critical-chain` | `Wants=` + `After=network-online.target`; app retries |
-| Restarting A also restarts B | B has `Requires=A` / `BindsTo=A` / `PartOf=A` | `systemctl show B -p Requires,BindsTo,PartOf` | Use `Wants=` |
-| "Start request repeated too quickly" | Hit the start limit | `systemctl status` | Fix cause, `reset-failed`, set `RestartSec`/limits on purpose |
-| Unit failed, nobody knew | No alerting | — | `OnFailure=` alert unit |
-| "State 'stop-sigterm' timed out" | Shutdown slower than `TimeoutStopSec` | Journal | Raise timeout / shorten jobs |
-| Children killed before the main process can finish them | `KillMode=control-group` | Journal shows child killed by signal 15 | `KillMode=mixed` |
-| "more than one ExecStart= setting" | Drop-in added instead of replaced | Journal | `ExecStart=` empty line first |
-| Override ignored after package upgrade | You edited `/usr/lib/...` | `systemctl cat` path | Use a drop-in in `/etc` |
-| Template instance won't enable | No `[Install]` in the template | `systemctl cat name@.service` | Add `WantedBy=` |
-| User service stops at logout | No lingering | `ls /var/lib/systemd/linger` | `loginctl enable-linger USER` (decide on purpose) |
-| `systemctl --user` fails via `sudo -u` | No user session bus | — | SSH in as the user |
-| Slow boot | One unit waiting on a timeout | `systemd-analyze blame` / `critical-chain` | Fix the slow unit (e.g. `optional: true` interface) |
+| Concept | Key point |
+|---|---|
+| Program vs process | File on disk vs running instance |
+| PID / PPID | Process ID / parent's ID; all processes form a tree under PID 1 |
+| PID 1 / PID 2 | systemd (init, adopts orphans) / kthreadd (kernel threads) |
+| Threads | Share the process's memory; `ps -L`, `top` + `H` |
+| `/proc/PID/` | `status`, `cmdline`, `environ`, `exe`, `cwd`, `fd/`, `limits` |
+| fds 0/1/2 | stdin / stdout / stderr |
+| `ps -eo ...` | Snapshot with chosen columns; `%cpu` is lifetime average |
+| `pgrep -a` / `pstree -p` / `top` | Find / family tree / live view |
+| States | `R` running, `S` sleeping, `D` stuck in kernel I/O, `T` stopped, `Z` zombie |
+| Exit codes | 0 OK; 126/127; 128+N = killed by signal N (130, 137, 143) |
+| Zombie | Finished, not yet reaped; can't be killed; fix the parent |
+| Orphan | Parent died; adopted by PID 1 or a subreaper; keeps running |
+| PID 1 | Reaps orphans; ignores unhandled signals; containers need `--init` |
+| Signals | Default / catch / ignore; SIGKILL and SIGSTOP can't be caught |
+| SIGTERM vs SIGKILL | Polite stop with cleanup vs instant kill; always TERM first |
+| SIGHUP | Terminal closed — or "reload" for daemons |
+| Who can signal | Own processes; root/`CAP_KILL` for others |
+| Jobs | `&`, `Ctrl+Z`, `jobs`, `fg`, `bg`, `kill %1` |
+| Logout | SIGHUP kills your jobs; use `tmux` or `systemd-run` for long work |
+| Graceful shutdown | Stop new work → finish current → clean up → exit before timeout |
+| `trap` | `EXIT` for cleanup; traps wait for foreground commands; children aren't killed with the script |
+| `timeout` | Limit run time; exit code 124 |
+| `nice` / `ionice` | CPU / disk priority; matters only under contention |
+| `D` state | Waiting in kernel I/O; even `kill -9` waits; fix the storage |
 
 ---
 
 # Appendix — Command reference
 
-## Inspect
+## Viewing
 
 | Command | Purpose |
 |---|---|
-| `systemctl status UNIT --no-pager` | State and recent logs |
-| `systemctl cat UNIT` | Combined files |
-| `systemctl show UNIT -p After,Wants,Requires,PartOf` | Relations |
-| `systemctl show UNIT -p NRestarts,Restart,TimeoutStopUSec,KillMode` | Restart/stop settings |
-| `systemctl is-active UNIT` / `is-enabled UNIT` | Now / at boot |
-| `systemctl list-units --failed` | Broken units |
-| `systemctl list-units 'worker@*'` | Template instances |
-| `systemctl list-dependencies TARGET` | What a target pulls in |
-| `systemd-delta --type=extended,overridden` | All local overrides |
-| `journalctl -b -u UNIT` | This boot's logs for a unit |
+| `echo $$` / `echo $PPID` | Current shell PID / its parent |
+| `ps aux` / `ps -ef` | All processes |
+| `ps -eo pid,ppid,user,stat,etime,%cpu,%mem,rss,cmd --sort=-%cpu` | Custom columns, sorted |
+| `ps -fp PID` / `ps -u user` / `ps -f --ppid PID` | One process / a user's / children |
+| `ps -L -p PID` | Threads |
+| `pgrep -a name` / `pgrep -f pattern` / `pidof prog` | Find PIDs |
+| `pstree -p` / `pstree -s -p PID` | Tree / ancestors |
+| `top` (`P`, `M`, `c`, `1`, `H`, `k`, `r`) | Live view and keys |
+| `htop` | Friendlier live view |
 
-## Change
-
-| Command | Purpose |
-|---|---|
-| `systemd-analyze verify FILE` | Check a unit before loading |
-| `systemctl daemon-reload` | Load changed files |
-| `systemctl enable --now UNIT` | Start now and at boot |
-| `systemctl reenable UNIT` | Redo enable after `[Install]` changed |
-| `systemctl reset-failed UNIT` | Clear failed state |
-| `systemctl edit UNIT` | Drop-in for a package unit |
-| `systemctl restart myapps.target` | Restart a group (with `PartOf=`) |
-
-## Boot
+## Inspecting one process
 
 | Command | Purpose |
 |---|---|
-| `systemd-analyze` | Boot time |
-| `systemd-analyze blame` | Slowest units |
-| `systemd-analyze critical-chain [UNIT]` | What a unit waited on |
-| `networkctl list` | Interface states (wait-online) |
+| `grep -E '^(Name\|State\|PPid\|Uid\|Threads\|VmRSS)' /proc/PID/status` | Summary |
+| `tr '\0' ' ' < /proc/PID/cmdline` | Full command line |
+| `sudo ls -l /proc/PID/exe /proc/PID/cwd` | Real program and working directory |
+| `sudo ls -l /proc/PID/fd` / `sudo lsof -p PID` | Open files and sockets |
+| `ps -o pid,stat,wchan:32,cmd -p PID` | What a stuck process waits on |
+| `sudo ss -tnp \| grep PID` | Its network connections |
 
-## User services
+## Signals
 
 | Command | Purpose |
 |---|---|
-| `systemctl --user daemon-reload / enable --now / status UNIT` | Manage own services |
-| `journalctl --user -u UNIT` | Own service logs |
-| `loginctl enable-linger USER` / `disable-linger USER` | Allow / stop running without login |
-| `ls /var/lib/systemd/linger/` | Who has lingering |
+| `kill PID` / `kill -TERM PID` | Polite stop |
+| `kill -9 PID` / `kill -KILL PID` | Forced stop (last resort) |
+| `kill -HUP PID` | Reload (daemons) |
+| `kill -STOP PID` / `kill -CONT PID` | Pause / resume |
+| `kill -TERM -- -PGID` | Whole process group |
+| `kill -0 PID` | Exists and allowed? |
+| `pkill -u user name` / `pkill -f pattern` | By name/user / command line |
+| `kill -l` | List signals |
 
-## Patterns used in this note
+## Jobs and detaching
 
-| Pattern | Purpose |
+| Command | Purpose |
 |---|---|
-| `Wants=` + `After=network-online.target` | Start after the network is up |
-| `Wants=` + `After=api.service` | Soft dependency with order |
-| `PartOf=myapps.target` + `WantedBy=myapps.target` | Group control |
-| `StartLimitIntervalSec=` / `StartLimitBurst=` + `OnFailure=notify-failure@%n.service` | Give up and alert |
-| `RestartSec=` / `RestartSteps=` / `RestartMaxDelaySec=` | Backoff |
-| `KillMode=mixed` + `TimeoutStopSec=` | Graceful stop of a parent with children |
-| `Key=` empty line in drop-in | Clear a list before replacing |
-| `name@.service` + `%i` | Template instances |
-| `NoExecPaths=` / `ProtectProc=invisible` | Block running files from writable dirs / hide other processes |
+| `cmd &` / `jobs -l` | Background / list jobs |
+| `fg %N` / `bg %N` / `kill %N` | Foreground / continue in background / signal a job |
+| `Ctrl+C` / `Ctrl+Z` / `Ctrl+\` | SIGINT / SIGTSTP / SIGQUIT |
+| `nohup cmd > log 2>&1 &` | Survive logout |
+| `disown %N` | Detach an already-running job |
+| `setsid cmd` | New session |
+| `tmux new -s name` / `tmux attach -t name` / `Ctrl+b d` | Persistent terminal session |
+| `systemd-run --unit=name --uid=user cmd` | Run as a temporary unit with logs |
+
+## Scripts
+
+| Command | Purpose |
+|---|---|
+| `trap cleanup EXIT` | Cleanup on any exit |
+| `trap 'exit 143' TERM` / `trap 'exit 130' INT` | Handle stop / Ctrl+C |
+| `cmd & child=$!; wait $child` | Background + wait (signals handled immediately) |
+| `timeout -k 1m 30m cmd` | Time limit with forced kill |
+
+## Priority
+
+| Command | Purpose |
+|---|---|
+| `nice -n 10 cmd` | Start with lower CPU priority |
+| `renice -n 15 -p PID` | Change a running process |
+| `ionice -c 3 cmd` | Idle disk priority |
+| `ps -o pid,ni,pri,cmd -p PID` | Check priority |

@@ -81,16 +81,58 @@ hash -r           # clear the shell's remembered paths
 
 ## 2.2 fork and exec
 
-Linux starts a new program in two steps.
+This is the heart of the whole note. Take it slowly.
 
-**fork** — the shell makes a **copy of itself**. The copy is the child process. It has a new PID but the same memory: same variables, same current folder, same open files.
+### First: what a process is
 
-**exec** — the child **replaces itself** with the new program (`node`). The PID stays the same. The old shell code is gone. Only a few things survive the replace:
+A **program** is a file on disk (`/usr/bin/node`). A **process** is that program **running** — loaded into memory, with its own private memory, its own current folder, its own open files, and a number that identifies it while it runs, the **PID** (process ID). Running the same program twice gives two processes with two PIDs. (Note 9 goes deep on processes; this much is enough here.)
 
-- current folder
-- open files (stdin, stdout, stderr)
-- user and group
-- **the environment variables** (only the exported ones — Note 2)
+Your shell is itself a process. So the question "how does the shell run `node`?" is really "how does one process start **another** process?".
+
+### The surprise: it takes two steps, not one
+
+You'd expect one step: "shell, please start `node`." Linux doesn't work that way. A process can't conjure another process out of nothing — the **only** way to make a new process is for an existing one to **copy itself**. So starting `node` is two steps:
+
+1. **fork** — the shell clones itself. Now there are two near-identical shells.
+2. **exec** — the clone throws away the shell program it's running and **becomes** `node` instead.
+
+That "copy yourself, then immediately replace the copy" feels wasteful the first time you see it. Stay with it — the gap between the two steps is exactly what makes the shell powerful (below).
+
+### fork — clone the process
+
+**fork** makes a **copy of the calling process**. The copy is the **child**; the original is the **parent**. Right after the fork they're almost identical — same memory, same variables (exported *and* not), same current folder, same open files. The one thing that differs is the PID: the child gets a new one.
+
+```bash
+echo "shell  $$"          # the shell's PID, e.g. 35776
+bash -c 'echo "child $$"' # a child's PID,  e.g. 35777  ← a different process
+echo "shell  $$"          # still 35776                 ← the parent is unchanged
+```
+
+The child is a **separate** process. Nothing it does to its own memory, variables, or current folder can reach back and change the parent. Hold onto that — it's the reason `cd` in a script doesn't move *your* shell (Step 3), and the reason a child can't change a parent's variables (Note 2).
+
+### exec — become a different program
+
+The clone doesn't stay a shell. **exec** replaces the program running inside the process with a new one (`node`): the old shell code and memory are wiped and `node` is loaded in their place. Crucially, this happens **inside the same process** — the **PID does not change**. The process that was a bash clone is now `node`, same PID, same desk.
+
+### Why some things survive exec and others don't
+
+This is the part worth slowing down on. A running process has **two separate kinds of state** — remember these two as **kind 1** and **kind 2**; later phases refer back to them by those names:
+
+1. **Kind 1 — the program's own memory.** Its code, and the variables and data it built up while running. For the shell clone, that's all of bash: its shell variables, functions, aliases, everything.
+2. **Kind 2 — the kernel's record about the process.** A small card the kernel keeps for every process: its PID, which user and group it runs as, its current folder, a table of its open files, and its environment list. This lives in the **kernel**, not inside the program.
+
+**exec wipes kind 1 and keeps kind 2.** The program's memory is thrown out and replaced by `node` — so bash's shell variables, functions, and aliases are **gone**. But the kernel's card is untouched, so everything on it carries straight into `node`:
+
+| Survives (on the kernel's card) | So the new program… |
+|---|---|
+| **current folder** | starts in the same directory you were in |
+| **open files** (stdin, stdout, stderr) | reads and writes the same places — this is how a redirect or pipe set up in the gap reaches `node` |
+| **user and group** | runs as the same identity (unless the gap changed it, e.g. `sudo -u`) |
+| **the environment variables** | receives them — but only the *exported* ones, because only those were copied onto the card as the environment (Note 2) |
+
+That last row is the whole reason the exported/not-exported distinction matters: an ordinary shell variable lives in the program's memory (kind 1), so exec throws it away; an **exported** variable was placed in the environment list on the kernel's card (kind 2), so it survives into the new program. Note 2 is entirely about that line.
+
+### The whole sequence
 
 ```
  bash (PID 100)
@@ -101,18 +143,33 @@ Linux starts a new program in two steps.
    │
    │ exec node server.js
    ▼
- node (PID 101)            ← bash code replaced; only exported variables passed in
+ node (PID 101)            ← bash code replaced; same PID; only exported variables passed in
    │
    │ exits with code 0
    ▼
  bash (PID 100) gets $? = 0
 ```
 
-This one picture explains most of both notes:
+The parent (PID 100) was never touched; it just waits for the child (PID 101) to finish and collects its exit code in `$?` (step 5 of 2.1).
 
-- **A child can't change its parent** — it is a separate copy.
-- **Only exported variables reach programs** — exec passes only the environment list.
-- **`cd` in a script doesn't change your folder** — the script is a child.
+### Why two steps? The gap is the point
+
+Here's the payoff that makes the design click. Between the fork and the exec, the child is **still running shell code**, and it's a throwaway copy — so the shell can **adjust the child's world** before it becomes the new program, without affecting itself. That gap is how the shell implements its most everyday features:
+
+| You type | In the gap, the child... | then execs |
+|---|---|---|
+| `node > out.log` | points its stdout at `out.log` | `node` — which writes to the file without knowing |
+| `sudo -u api node` | switches user to `api` | `node` — now running as `api` |
+| `a \| b` | wires its output to `b`'s input | the two programs |
+
+The program being run needs to know nothing about any of this. It just starts with the folder, files, user, and environment the child arranged. One clone-then-replace mechanism gives you redirection, pipes, user switching, and more.
+
+### What this one picture explains
+
+- **A child can't change its parent** — it's a separate copy (fork).
+- **Only exported variables reach programs** — exec passes only the environment list (Note 2).
+- **`cd` in a script doesn't change your folder** — the script runs in a child (Step 3).
+- **Redirection and pipes work at all** — arranged in the gap between fork and exec.
 
 ## 2.3 Seeing it happen
 
@@ -155,14 +212,49 @@ That's also why:
 
 ## 3.3 Functions and aliases
 
-Some "commands" are shell functions loaded from startup files. They exist **only in shells that loaded them**.
+Not every "command" is a program on disk. Two of them — aliases and functions — are things the shell **keeps in its own memory**, which changes where they're available.
+
+**An alias** is a simple text shortcut. You define one, and from then on the shell swaps the short word for the longer text *before* running the command:
+
+```bash
+alias ll='ls -l'      # define it
+ll                    # the shell rewrites this to: ls -l
+```
+
+**A function** is a named block of shell commands, run inside the current shell (like a built-in you wrote yourself):
+
+```bash
+greet() { echo "hi from PID $$"; }    # define it
+greet                                 # runs the block: hi from PID 36067
+```
+
+Neither is a file. There's no `ll` or `greet` anywhere in `/usr/bin`, so a PATH search would never find them — which is why they sit **above** PATH in the lookup order from 2.1 (alias → function → builtin → PATH).
+
+### Why they exist "only in shells that loaded them"
+
+Think back to the two kinds of state from Phase 2.2. An alias or a function lives in **the shell's own memory** (kind 1) — not as a file on disk, and not on the kernel's card. So:
+
+- It exists only inside the one shell process where you defined it (or where a startup file defined it).
+- A **child** shell starts as a fresh program and doesn't have it — nothing in your shell's memory crosses into a new process:
+
+```bash
+greet() { echo "hi"; }
+greet                    # hi
+bash -c greet            # bash: greet: command not found   ← the child never defined it
+```
+
+This is exactly why a new shell needs to **re-read** its startup files to get its aliases and functions back (Phase 5). Each shell rebuilds them from scratch; they don't travel with you.
+
+### Why this bites: nvm
+
+`nvm` isn't a program — it's a shell **function**, loaded by `~/.bashrc`:
 
 ```bash
 type nvm         # nvm is a function
 which nvm        # (nothing) — which only searches PATH for files
 ```
 
-This is why `nvm use 20` works in your terminal but fails in scripts, cron, and services: those shells never loaded the function. (Scenario step 4.)
+So `nvm use 20` works in your interactive terminal (which read `~/.bashrc`), but fails in scripts, cron jobs, and services — those run in non-interactive shells that read **no** startup files (Phase 5.2), so the function was never defined there. The fix is to load nvm's file inside the script, or skip the function and call the `node` binary by its full path (Scenario step 4).
 
 ---
 
@@ -239,13 +331,21 @@ exec > /var/log/deploy.log 2>&1   # everything after this goes to the log
 
 # Phase 5 — Shell types and startup files
 
+### The problem startup files solve
+
+Every new shell is a fresh process (fork + exec, Phase 2). From 3.3, you know that means it starts **empty** of aliases, functions, and the prompt — none of those cross over from another shell. So how does a shell you just opened already know your `PATH`, your aliases, your `nvm`, your prompt?
+
+It runs **startup files** — scripts of shell commands (`~/.bashrc` and friends) that the shell `source`s into itself (Phase 6) the moment it starts, rebuilding your setup. "Startup files" are just normal shell scripts that bash reads automatically at the right moment.
+
+The catch: bash reads **different** startup files depending on *how* it was started, and getting surprised by which file ran (or didn't) is behind most "it works in my terminal but not in the script" problems. So first, the three ways a shell starts.
+
 ## 5.1 Three types
 
-| Type | When it happens | Check |
+| Type | When it happens | Why it's treated specially |
 |---|---|---|
-| **Login shell** | SSH login, console login, `su - user`, `sudo -i`, `bash -l` | `echo $0` shows `-bash` |
-| **Interactive non-login** | New terminal window on a desktop, typing `bash`, VS Code terminal | prompt shown, no `-` |
-| **Non-interactive** | `bash script.sh`, `./script.sh`, cron jobs, systemd services | no prompt |
+| **Login shell** | SSH login, console login, `su - user`, `sudo -i`, `bash -l` | You just **arrived** — set up one-time things (PATH, environment) |
+| **Interactive non-login** | New terminal window on a desktop, typing `bash`, VS Code terminal | You're **already in**, opening another shell for typing — just needs the per-shell comforts (aliases, prompt) |
+| **Non-interactive** | `bash script.sh`, `./script.sh`, cron jobs, systemd services | A **program**, not a person — no prompt, wants to start fast and predictably |
 
 ```bash
 shopt -q login_shell && echo login || echo non-login
@@ -263,7 +363,16 @@ shopt -q login_shell && echo login || echo non-login
 
 Ubuntu's default `~/.profile` loads `~/.bashrc`, so SSH logins get both.
 
-**Gotcha:** if you create a `~/.bash_profile`, bash stops reading `~/.profile`, so `~/.bashrc` is no longer loaded on login either. (Scenario step 2.)
+### Why the split makes sense
+
+The login vs non-login division looks arbitrary until you connect it to the two kinds of state from Phase 2.2:
+
+- **One-time setup** — `PATH`, environment variables — goes in the **login** files (`~/.profile`). You set it once when you arrive, because environment variables are **kind 2 state: they inherit automatically** from a shell to every child it starts (Note 2). So a terminal you open later already has your `PATH` without re-reading anything.
+- **Per-shell setup** — aliases, functions, the prompt — goes in `~/.bashrc`, read by **every interactive** shell. These are **kind 1 state: they do *not* inherit** (3.3), so each new interactive shell has to rebuild them for itself.
+
+That's the whole logic: inherit it once → login file; rebuild it every time → `~/.bashrc`. And since a non-interactive shell (a script) is neither — it inherits the environment from its parent and needs no aliases or prompt — it reads **nothing**, which is exactly why `nvm` is missing there (3.3).
+
+**Gotcha:** if you create a `~/.bash_profile`, bash reads it and **stops** looking for `~/.profile` (it reads only the first of the three that exists). Ubuntu's `~/.profile` was the file loading `~/.bashrc`, so now `~/.bashrc` isn't loaded on login either, and your aliases and `nvm` vanish. (Scenario step 2.)
 
 ## 5.3 What to put where
 
@@ -288,6 +397,11 @@ Simple rule used on Ubuntu: put most things in `~/.bashrc`, and keep `~/.profile
 
 # Phase 6 — Running scripts: `./script`, `bash script`, `source`
 
+There are a few ways to run a script, and they differ on two questions that you already have the tools to answer:
+
+1. **Does it run in a new process, or in your current shell?** The first three below make a **child** (fork + exec, Phase 2), so anything the script changes — its folder, its variables — is lost when it ends (Step 3). `source` is the exception: it runs the lines **in your current shell**, so its changes stick. That's the single most important column.
+2. **Who launches the file — the kernel, or an interpreter you named?** With `./deploy.sh` *you* ask the kernel to execute the file directly, so the kernel must be told it's executable (`chmod +x`) and must read the first line to learn which interpreter to use (the **shebang**). With `bash deploy.sh` you launch the `bash` program and hand it the script as a plain text file to read — so no execute bit is needed and the shebang is just a comment (bash is already the interpreter).
+
 | How | Runs in | Uses shebang? | Needs `chmod +x`? | Can change your shell? |
 |---|---|---|---|---|
 | `./deploy.sh` | New process | **Yes** | **Yes** | No |
@@ -295,9 +409,11 @@ Simple rule used on Ubuntu: put most things in `~/.bashrc`, and keep `~/.profile
 | `sh deploy.sh` | New sh process | **No** (ignored) | No | No |
 | `source deploy.sh` or `. deploy.sh` | **Current shell** | No | No | **Yes** |
 
+So the first three answers to "can it change my shell?" are all **No** for the same reason — they're children — and `source` is **Yes** for the same reason — it isn't a child at all.
+
 ## 6.1 The shebang
 
-The first line of a script, starting with `#!`:
+A script is just a text file — the system has no built-in idea that `deploy.sh` is "a bash script" or that `backup.py` is "a Python script". The **shebang** is how the file says which interpreter should run it. It's the first line, starting with the two characters `#!` followed by the path to a program:
 
 ```bash
 #!/bin/bash
@@ -305,7 +421,41 @@ The first line of a script, starting with `#!`:
 #!/usr/bin/env python3
 ```
 
-When you run `./deploy.sh`, the **kernel** reads this line and runs that interpreter with your script. It only matters for `./script` — `bash script` and `sh script` ignore it.
+### What the kernel actually does with it
+
+Recall from Phase 6's intro that `./deploy.sh` asks the **kernel** to execute the file directly. The kernel reads the first two bytes; if they're `#!`, it doesn't try to run the file as a program itself — instead it runs the interpreter named on that line and hands it the script. So:
+
+```bash
+./deploy.sh
+```
+effectively becomes:
+```bash
+/bin/bash ./deploy.sh     # because the first line was #!/bin/bash
+```
+
+The shebang is literally **a path to a program the kernel will launch**, which is why it must be an **absolute path** (`/bin/bash`, not `bash`) — the kernel doesn't do a PATH search.
+
+### Why `#!` is a `#`
+
+Notice the line also starts with `#`, which is a **comment** in bash, sh, Python, and most scripting languages. That's deliberate: the kernel treats `#!…` as the interpreter line, but once bash (or python) is running the script, that same first line is just a comment it harmlessly ignores. One line, read two different ways.
+
+### `#!/usr/bin/env python3` — and why it's common
+
+A plain `#!/usr/bin/python3` hardcodes one exact path. If Python lives somewhere else — a virtualenv, a user install, a different distro — the script breaks. `#!/usr/bin/env python3` instead runs the `env` program, whose job here is to **search `$PATH`** for `python3` and run the first one it finds:
+
+```bash
+#!/usr/bin/env python3    # runs whichever python3 is first on PATH (e.g. a virtualenv's)
+```
+
+The trade-off: it's portable, but you get *whichever* `python3` is on `$PATH`, which isn't always the one you meant. (`env` is itself at a fixed path, `/usr/bin/env`, so that part is safe.)
+
+### No shebang, or the wrong one
+
+If a file has **no** shebang and you run `./script`, the kernel can't tell what interpreter to use and refuses to execute it (the raw `execve` fails with `ENOEXEC`). Shells then paper over this inconsistently — bash, for instance, falls back to running it with a plain `sh` — so the script may run under a different shell than you expect, or not at all. Don't rely on the fallback: **give every script a shebang.**
+
+### When it matters
+
+The shebang only has an effect when the **kernel** launches the file — that is, `./script` (and the same when cron or systemd runs a script by its path). When you run `bash deploy.sh` or `sh deploy.sh`, *you've already named the interpreter*, so the shebang line is ignored and runs only as a comment. This is the mechanism behind Scenario step 6: a script tested with `bash backup.sh` passes, but the same file run as `./backup.sh` (or by cron) obeys its `#!/bin/sh` shebang and runs under dash, where bash-only syntax fails.
 
 ## 6.2 When to use which
 
@@ -316,6 +466,12 @@ When you run `./deploy.sh`, the **kernel** reads this line and runs that interpr
 ---
 
 # Phase 7 — `sh` vs `bash` vs `zsh`
+
+"The shell" isn't one program — it's a family of them, and they don't all understand the same syntax. `bash` added many conveniences over the years; the minimal POSIX shell (`dash` on Ubuntu) doesn't have them. A script written with bash conveniences will **fail** if something runs it with a plainer shell — and on Ubuntu that happens more easily than you'd expect, because of one trap:
+
+> **`/bin/sh` is not bash.** On Ubuntu it's `dash`, a small, fast, strict POSIX shell. So a script with `#!/bin/sh` runs under dash, and any bash-only syntax in it breaks — even though typing `bash script` by hand would have worked. This is the core of Scenario step 6.
+
+This phase is about knowing which shell you're actually running under, and which syntax is safe in each.
 
 ## 7.1 The shells
 
