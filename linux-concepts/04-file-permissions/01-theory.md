@@ -74,17 +74,51 @@ Change: 2026-10-17 09:19:44
 
 ## 1.3 Hard links and symlinks
 
-| | Hard link | Symbolic link (symlink) |
-|---|---|---|
-| What | A second name for the **same inode** | A small file containing a **path** to another file |
-| Permissions | Shared — it *is* the same file | Its own `lrwxrwxrwx` is ignored; the **target's** permissions apply |
-| Deleting the original | Data stays until the last name is removed | Link breaks ("dangling") |
-| Across filesystems | No | Yes |
+This is just 1.1 taken one step further. We said a name and the file are **two separate things**: the inode is the real file, and a directory entry is only a name pointing at an inode number. The obvious next question is — *what if two names point at the same inode? what if a name points at another name?* Those two answers are exactly hard links and symlinks.
+
+**Hard link — a second name for the same inode.**
+
+There is nothing special about "the original" name. A filename was always just a directory entry pointing at an inode number (1.1). A hard link adds **another** directory entry pointing at the **same** inode number. Now the file has two names, equally real — neither is the "true" one.
+
+```
+report.txt ─────┐
+                ├──▶ inode 393812  (the actual file: data + owner + permissions)
+report-hard.txt ┘
+```
+
+Because both names reach the same inode, they share *everything* the inode holds — same data, same owner, same permission bits. Change the file through one name and you see it through the other; they are the same file. The inode keeps a **link count** of how many names point at it (that's the `Links:` field `stat` showed in 1.1). Deleting a name doesn't erase the data — it just removes one directory entry and drops the count by one. The data is freed only when the count hits **zero**, i.e. when the *last* name is gone. A hard link can't cross to another filesystem, because an inode number is only meaningful within its own filesystem.
+
+**Symlink — a tiny file that just holds a path.**
+
+A symlink is a different animal. It's its own little file with its own inode, and its entire contents are a **text path** to somewhere else — like a shortcut. When you open it, the kernel reads the path and follows it to whatever is there *right now*.
+
+```
+current ──▶ (a file whose contents are the text "/opt/api/releases/v2")
+                                                        │ followed at open time
+                                                        ▼
+                                              /opt/api/releases/v2
+```
+
+Two consequences fall straight out of "it only holds a path":
+
+- The symlink's own permissions (`lrwxrwxrwx`) are meaningless — what matters is the **target's** permissions, because that's the file you actually end up at.
+- If the target is renamed or removed, the path now points at nothing. The symlink still exists but is **dangling** (broken) — it was only ever text, and the text no longer resolves.
+
+This is why symlinks *can* cross filesystems (a path is just a path), and why they're used for things like `current → releases/v2`: swap what the name points at by rewriting one small path, without touching the real files.
 
 ```bash
-ln report.txt report-hard.txt     # hard link
-ln -s /opt/api/releases/v2 current   # symlink
+ln report.txt report-hard.txt        # hard link  — another name for the same inode
+ln -s /opt/api/releases/v2 current   # symlink     — a path pointing at the target
 ```
+
+Side by side:
+
+| | Hard link | Symbolic link (symlink) |
+|---|---|---|
+| What | A second name for the **same inode** | A small file whose contents are a **path** to another file |
+| Permissions | Shared — it *is* the same file | Its own `lrwxrwxrwx` is ignored; the **target's** permissions apply |
+| Deleting the original | Data stays until the **last** name is removed (link count → 0) | Link breaks ("dangling") — the path no longer resolves |
+| Across filesystems | No (inode numbers are per-filesystem) | Yes (a path is just text) |
 
 > **How this goes wrong:** in world-writable folders like `/tmp`, an attacker can create a symlink or hard link named like a file a root process will write, making root write somewhere else. Linux protects against this with `fs.protected_symlinks` and `fs.protected_hardlinks` (should be `1`; check with `sysctl fs.protected_symlinks fs.protected_hardlinks`).
 
@@ -319,18 +353,42 @@ Symbolic is safer when you want to change **one** bit without touching the other
 
 ## 6.3 Recursive changes: the capital `X`
 
+**The dilemma.** Recursion (`-R`) applies *one* mode to every item in a tree. But Phase 3 showed that files and directories want **opposite** things from the `x` bit:
+
+- a **file** usually should **not** have `x` (it's data, not a program), and
+- a **directory** always **needs** `x`, or no one can enter it or reach anything inside.
+
+So any single mode you hand to `chmod -R` is wrong for one of the two. Both common attempts break something:
+
 ```bash
-chmod -R 644 /srv/projects        # WRONG: removes x from directories → nobody can enter them
-chmod -R 755 /srv/projects        # WRONG: makes every file executable
+chmod -R 644 /srv/projects        # WRONG: strips x from directories → nobody can cd in or reach files
+chmod -R 755 /srv/projects        # WRONG: makes every ordinary file executable
 ```
 
-Capital **`X`** means "execute, but only for directories (and files that already have an x somewhere)":
+The first locks everyone out of the folders; the second marks all your data files as programs. You want different `x` for the two kinds — but `-R` only lets you say one thing.
+
+**The fix: capital `X`.** Lowercase `x` means "set execute, always." Capital **`X`** means "set execute **only where it makes sense**" — specifically, `chmod` grants `x` to an item only if **either**:
+
+1. the item is a **directory**, or
+2. the item is a file that **already had `x`** for *some* class (so it was already meant to be a program — e.g. a script with its executable bit set).
+
+A plain data file (no `x` anywhere) is left non-executable. That's exactly the file-vs-directory split you wanted, decided per item, in a single command:
 
 ```bash
-chmod -R u=rwX,g=rX,o= /opt/api/releases    # dirs 750, files 640 (scripts keep their x)
+chmod -R u=rwX,g=rX,o= /opt/api/releases    # dirs → 750, data files → 640, scripts keep their x
 ```
 
-Or treat files and directories separately with `find`:
+Walk the rule through that tree:
+
+| Item | Before | `X` grants x? | Result |
+|---|---|---|---|
+| a folder | directory | yes (rule 1) | `rwx` for owner → enterable |
+| `config.json` | `rw-` data file | no (not a dir, no existing x) | stays non-executable |
+| `deploy.sh` | already `rwx` (a script) | yes (rule 2 — had x) | keeps its executable bit |
+
+So `X` is "fix the directories without turning my data into programs." The one caveat is rule 2: if a data file somehow *already* has a stray `x` bit, `X` will keep it — recursive `X` preserves existing executability, it doesn't audit whether it was deserved.
+
+**The explicit alternative.** When you'd rather not rely on that rule, split the two kinds by hand with `find`, which is unambiguous about what it's touching:
 
 ```bash
 find /opt/api/releases -type d -exec chmod 755 {} +
@@ -408,13 +466,23 @@ Why `002` is safe for normal users: their private group contains only themselves
 
 # Phase 8 — Special bits: SUID, SGID, sticky
 
+**Why there are extra bits at all.** Everything so far — owner, group, other, and `rwx` — is a *static* model: it decides **who may touch a file**, and the answer never changes while a program runs. That's enough for most things, but three real situations slip through the cracks, and no combination of plain `rwx` can express them. Each special bit exists to patch exactly one of them:
+
+- **Problem 1 — a task needs more privilege than the person running it.** Changing your own password means writing `/etc/shadow`, which is owned by root and readable by no one else. We don't want to make `/etc/shadow` writable, and we don't want to hand every user root. We just need the `passwd` *program* to run with more power than its caller, for that one job. → **SUID** (and **SGID**) on a program: while it runs, it takes on the **file's owner (or group)** identity instead of the caller's.
+
+- **Problem 2 — a team shares a folder, but new files keep landing in the wrong group.** By default a new file gets the creator's *primary* group — their private group (Note 3). So in a shared `devs` folder, every file nimal creates is group `nimal`, and the rest of `devs` can't use it. There's no plain-`rwx` way to say "files born here should belong to this folder's team." → **SGID on a directory**: new entries **inherit the directory's group** automatically.
+
+- **Problem 3 — a shared drop folder lets people delete each other's files.** Recall from Phase 3.5 that deleting a file is a *directory* write, not a file write. So the moment a folder like `/tmp` is world-writable (which it must be — everyone needs to create temp files), anyone can also delete *anyone's* files. There's no plain-`rwx` way to say "you may create files, but only remove your own." → **the sticky bit**: only a file's **owner** (or the directory's owner, or root) may delete or rename it.
+
+So the three bits aren't a random grab-bag — they're three targeted answers: **borrow identity while running** (SUID/SGID on files), **inherit the right group** (SGID on dirs), and **restrict deletion in a shared folder** (sticky). The rest of the phase takes them one at a time.
+
 ## 8.1 Overview
 
 | Bit | Octal | On a file | On a directory |
 |---|---|---|---|
-| **SUID** | `4000` | Program runs with the **file owner's** UID | (ignored on Linux) |
-| **SGID** | `2000` | Program runs with the **file's group** | New files and folders **inherit the directory's group**; new subfolders also get SGID |
-| **Sticky** | `1000` | (ignored on Linux) | Only the **file's owner**, the **directory's owner**, or root can delete/rename entries |
+| **SUID** | `4000` | Program runs with the **file owner's** UID (not the caller's) | (ignored on Linux) |
+| **SGID** | `2000` | Program runs with the **file's group** (not the caller's group) | New files and folders **inherit the directory's group** (not the creator's primary group); new subfolders also get SGID |
+| **Sticky** | `1000` | (ignored on Linux) | Only the **file's owner**, the **directory's owner**, or root can delete/rename entries (not everyone with write on the folder) |
 
 How they look:
 
@@ -473,12 +541,18 @@ Use sticky on any directory that many users write to but shouldn't clean up for 
 
 ## 9.1 Why ACLs exist
 
-Normal permissions give you **one** owner, **one** group, and everyone else. Real needs often look like:
+**The wall.** Everything up to here has had only **three** slots to say who may do what: the **owner**, **one group**, and **everyone else**. That's the whole vocabulary. It works as long as each file's audience fits into exactly one group — but real access often doesn't:
 
-- `api` writes, `devs` read, `adm` read, nobody else → two groups need access
-- One contractor needs read access to one folder, without joining a whole group
+- `api` writes the log, `devs` read it, `adm` also read it, nobody else → that's **two** different groups needing different access. There's no second group slot.
+- One contractor needs read access to **one** folder — without joining a whole group that would hand them access everywhere that group is used.
 
-**ACLs (Access Control Lists)** add extra entries for **named users** and **named groups** on top of the normal bits. They're supported on ext4, XFS, and most Linux filesystems by default.
+**The usual workaround, and why it hurts.** The only way to express "two groups" with plain bits is to *invent a new group* that contains the union of everyone involved (say `api-and-devs`), then set that as the file's group. Do this a few times and you get a sprawl of hyphenated combo-groups, every membership change means editing groups and re-logging-in people (Note 3, 7.3), and a one-person exception still forces a whole new group. The model fights you because you're trying to encode a *list* of who-gets-what into a *single* group field.
+
+**The fix.** That's literally what the name says: an **ACL (Access Control List)** lets a file carry a **list** of permission entries instead of one group. On top of the normal owner/group/other bits, you can staple on extra entries for **named users** and **named groups** — "and also `devs` may read, and also user `contractor` may read" — each with its own `rwx`. The three-slot model becomes "three slots *plus* as many named exceptions as you need."
+
+So the two examples above become one-liners: add a `group:devs:r` entry and a `group:adm:r` entry to the log; add a `user:contractor:r` entry to the one folder. No new groups, no re-login, no collateral access elsewhere.
+
+ACLs are supported on ext4, XFS, and most Linux filesystems by default.
 
 ## 9.2 Reading an ACL
 

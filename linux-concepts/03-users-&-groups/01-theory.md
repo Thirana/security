@@ -506,11 +506,24 @@ On servers, the stronger policy is usually **no passwords for SSH at all** (keys
 
 ## 7.1 Every process carries an identity
 
-Users don't do things. **Processes** do — and each process carries:
+Phases 1–6 were about the **database** — the rows in `/etc/passwd` and `/etc/group` that describe who exists. But a row in a file never *does* anything. When a file gets written or a port gets opened, the thing doing it is a **running program** — a process. So the real question the kernel answers all day is not "who is this user?" but **"who does this process count as?"**
 
-- a **UID** (actually several — real, effective, saved; Note 7 explains them)
+**Where that identity lives.** Recall from Note 1 that for every process the kernel keeps a small record — a *card* — holding the facts it needs to manage that process: its PID, its current folder, its open files, and so on. (That was "kind 2" state: the kernel's record, the part that survives `exec`.) The process's **identity is written on that same card.** It is not looked up from `/etc/passwd` each time; it is a set of numbers sitting on the card, put there once and carried around.
+
+What's on the card, identity-wise:
+
+- a **UID** — actually a small set of UIDs, not one (see below)
 - a **primary GID**
 - a **list of supplementary GIDs**
+
+**Why more than one UID?** Most of the time a process is simply "you", and the extra copies are all equal, so you can ignore them. They exist for the one situation where a process needs to *act as* one user while *remembering* who it really is — for example `sudo`, or a SetUID program (Note 7 covers the mechanism). Two of the slots matter here:
+
+| Slot | Plain meaning |
+|---|---|
+| **real UID** | Who the process actually belongs to — who started it. |
+| **effective UID** | Who the kernel checks **right now**, for this permission decision. |
+
+Normally `real == effective`, so there's nothing to think about. They differ only when a program has deliberately switched identity. (There's also a *saved* UID — a parked copy used to switch back — and a *filesystem* UID, almost always equal to effective. Note 7 is where these earn their keep; here, just know the card has slots, not a single number.)
 
 ```bash
 grep -E '^(Uid|Gid|Groups)' /proc/self/status
@@ -521,29 +534,46 @@ Gid:    1101    1101    1101    1101
 Groups: 1101 2001 2004
 ```
 
+Here all four UID slots read `1101`: this process is plainly `nimal`, not pretending to be anyone. `Groups` is the supplementary list.
+
 ```bash
-ps -o pid,user,group,supgrp,cmd -p $$     # same thing via ps
+ps -o pid,user,group,supgrp,cmd -p $$     # same thing, shown by ps
 ```
 
-The kernel checks permissions against **these process values**, not against `/etc/passwd`.
+**The one rule to take from this phase:** the kernel checks permissions against **the numbers on the process's card**, never against `/etc/passwd` directly. The database only decides what gets *put on* the card, and only at the moment identity is set — which is the next section.
 
 ## 7.2 How a login sets them
 
+If identity is a set of numbers on the process's card, where do those numbers *come from*? They are not conjured per process and they are not re-read from the database as you work. They are stamped onto the card **once, at login**, and then inherited by everything you launch.
+
+Walk through what actually happens when you SSH in:
+
 ```
-sshd / login
-  │ 1. check password or key (PAM)
-  │ 2. look up user → UID, primary GID, group list (from /etc/passwd, /etc/group)
-  │ 3. set the process's group list, GID, then UID
+sshd (running as root)
+  │ 1. check your credentials         ← PAM: password or key
+  │ 2. look you up in the database     ← UID, primary GID, group list
+  │                                      from /etc/passwd + /etc/group
+  │ 3. stamp them onto the process:    ← group list, then GID, then UID  (order matters!)
   ▼
-your shell (bash)   ← now has your identity
-  │ fork + exec (Note 1)
+your login shell (bash)   ← its card now says "nimal"
+  │ fork + exec  (Note 1)
   ▼
-every program you run   ← inherits the same identity
+every program you run   ← inherits the same card → same identity
 ```
+
+A few things worth pulling out, because they're where the confusion usually is:
+
+- **sshd starts as root.** It has to — only root is allowed to *set* a process's identity to someone else. It checks who you are, then hands the session down to your unprivileged self. (PAM is just the pluggable machinery that does the credential check in step 1; think of it as "the thing that decides whether you're allowed in".)
+
+- **Why the order is group list → GID → UID, with UID last.** Setting identity is a privileged action: once the process drops to your ordinary UID, it *loses the power* to change the UID, GID, or group list. So everything that needs root must be done **before** the UID is lowered. UID goes last, like turning off the lights on your way out — after it, there's no going back up. (This is also exactly why a stale group list can't fix itself mid-session: the window to set the list has already closed. That's 7.3.)
+
+- **Then inheritance does the rest.** The login shell's card now says `nimal`. From Note 1: `fork` copies the card, and `exec` keeps it (identity is kind-2 state). So every command you run is automatically *you* — the kernel never asks for your password again, because it isn't re-deciding your identity, it's just copying the card down the chain.
+
+So "your identity" during a session is really **one snapshot**, taken at login from the database and then carried forward unchanged. Hold onto that — it explains the next two sections completely.
 
 ## 7.3 Group changes need a new login
 
-The group list is **copied into the process at login**. Changing `/etc/group` afterwards does not update processes that are already running.
+This falls straight out of 7.2: the group list is **a snapshot stamped on the card at login**, and the only moment the kernel sets it has already passed. So editing `/etc/group` now updates the *database*, but not the card of any process already running — including your current shell.
 
 ```bash
 sudo usermod -aG ops sachini       # sachini is logged in right now
@@ -570,11 +600,12 @@ Also: new SSH connections may reuse an existing connection if SSH multiplexing (
 
 ## 7.4 Files take the process's identity
 
-A new file gets:
+Same model, pointed the other way. When a process creates a file, the kernel stamps the new file's owner and group from the numbers **on that process's card** — not from whoever is sitting at the keyboard. A new file gets:
+
 - owner = the process's **effective UID**
 - group = the process's **effective GID** (primary group), or the folder's group if the folder has SGID (Note 5)
 
-That's why a file created by the API service is owned by `api`, even if *you* started the service.
+That's why a file created by the API service is owned by `api`, even if *you* started the service: the service's card says `api`, so its files say `api`.
 
 **Used in:** Note 4, Steps 5, 8.
 
