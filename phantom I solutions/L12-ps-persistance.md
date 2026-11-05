@@ -1,53 +1,61 @@
 # L12 — ps-persistence · Stay After the Reboot
-
+ 
 **Act III · Persistence and Evasion · T1543.002**
 **Status:** Solved
 **Flag:** `bl_35467ed6dfbdf5164361c3c28990ef68`
-
+ 
 ---
-
+ 
 ## Challenge brief
-
+ 
 > Access you cannot keep is access you do not have. Install exactly one mechanism that
 > brings you back after the host restarts. You are graded on it firing again, not on
 > creating a file. The check restarts the host by replaying its rc-local startup, so
 > that is the surface to land in.
-
+ 
 MITRE tag T1543.002 is "Create or Modify System Process: RC Scripts" — using the
 system's boot-time script execution mechanism to plant code that runs automatically on
 every restart.
-
+ 
 You land as root. The job is not to find a secret — it is to plant a persistence
-mechanism that fires when the box restarts, and to have that mechanism read a
-grader-supplied value and write it to the proof file.
-
+mechanism that fires when the box restarts, and have that mechanism read a grader-supplied
+value and write it to the proof file.
+ 
 ---
-
-## How the grader works
-
-Understanding the grader is essential to solving this level. Previous levels had a
-static secret on disk that you found and wrote to the proof file. This level is
-different — the proof value is not pre-placed for you to discover. Instead:
-
-1. The grader plants a unique per-session token at `/opt/.persist-target` before the
-   simulated restart.
-2. The grader calls `/usr/local/bin/boot.sh` to simulate the restart.
-3. `boot.sh` runs every executable `.start` script in `/etc/local.d/`.
-4. After `boot.sh` finishes, the grader reads `/tmp/.ps-persist-proof` and compares
-   it to the token it planted at `/opt/.persist-target`.
-5. If they match, the level is solved.
-
-This design tests whether you planted a real persistence mechanism — not whether you
-found a static answer. Your script must be in `/etc/local.d/`, must be executable, and
-must read `/opt/.persist-target` and write its contents to `/tmp/.ps-persist-proof`
-when called.
-
-Reading `boot.sh` reveals the exact mechanism:
-
+ 
+## How this level is different from previous ones
+ 
+In every previous level, a secret existed on disk before you arrived. You found it,
+wrote it to the proof file, and the grader confirmed it matched what was planted.
+ 
+This level breaks that pattern. The challenge description says: "You are graded on it
+firing again, not on creating a file." The grader is not checking whether you found
+something — it is checking whether your code ran during the simulated restart.
+ 
+To verify that your code actually ran (rather than you just writing a value directly),
+the grader uses a token system:
+ 
+1. **Before the simulated restart**, the grader writes a unique random token to
+   `/opt/.persist-target`. You do not know this token in advance — it is generated
+   fresh each time you call `verify`.
+2. **During the simulated restart**, the grader runs `boot.sh`, which executes every
+   executable `.start` script in `/etc/local.d/`. Your planted script runs here.
+3. **After the restart**, the grader reads `/tmp/.ps-persist-proof` and checks whether
+   it matches the token it wrote to `/opt/.persist-target`.
+If they match, it means your script ran during the boot sequence — because that is the
+only way your script could have read the token and written it to the proof file. You
+cannot cheat by writing the proof file directly before calling `verify`, because you do
+not know what token the grader will plant.
+ 
+This is the core of the grading logic: the token is the grader's way of proving that
+your code ran during boot, not just that a file exists.
+ 
+### What boot.sh does
+ 
 ```sh
 cat /usr/local/bin/boot.sh
 ```
-
+ 
 ```sh
 #!/bin/sh
 # System-startup harness. Replays every executable rc-local service, exactly as an
@@ -55,77 +63,101 @@ cat /usr/local/bin/boot.sh
 # player's persistence mechanism re-fires. Spiked 2026-09-07: survival-graded.
 for s in /etc/local.d/*.start; do [ -x "$s" ] && "$s"; done
 ```
-
-Three conditions your script must satisfy:
-- Located in `/etc/local.d/`
-- Named with a `.start` extension
-- Executable (`chmod +x`)
-
+ 
+It loops over every file matching `/etc/local.d/*.start` and runs the ones that are
+executable. This is exactly what Alpine's OpenRC `local` service does on a real boot.
+The grader calls this instead of actually rebooting the container, which would destroy
+the session.
+ 
+Three conditions your script must satisfy for it to be picked up:
+- File must be in `/etc/local.d/`
+- File name must end in `.start`
+- File must be executable (`chmod +x`) — the `[ -x "$s" ]` check skips non-executable
+  files silently, giving no error
+### The grading sequence visualised
+ 
+```
+verify called
+     │
+     ▼
+grader writes token → /opt/.persist-target   (e.g. "665b2fa28da95a0386b7bb221310d292")
+     │
+     ▼
+grader calls /usr/local/bin/boot.sh
+     │
+     ▼
+boot.sh runs /etc/local.d/persist.start     (your planted script)
+     │
+     ▼
+your script reads /opt/.persist-target → writes to /tmp/.ps-persist-proof
+     │
+     ▼
+grader reads /tmp/.ps-persist-proof
+     │
+     ├── matches token → Level solved
+     └── does not match → "value written on restart is wrong"
+         file missing → "no proof after the simulated restart"
+```
+ 
+The two error messages tell you exactly where in the sequence things failed:
+- "no proof after the simulated restart" — your script either didn't run, isn't
+  executable, or didn't write the file at all
+- "the value written on restart is wrong" — your script ran and wrote something, but
+  it wasn't reading from `/opt/.persist-target`
 ---
-
+ 
 ## Alpine Linux boot persistence — how it differs from Ubuntu
-
+ 
 The topic note was written for Ubuntu with systemd. Alpine uses OpenRC, which works
 differently.
-
+ 
 ### Ubuntu/systemd approach
-
-On Ubuntu, rc.local is a compatibility shim handled by `rc-local.service`. The file
-`/etc/rc.local` is executed by systemd during boot. Systemd manages service ordering,
-dependencies, and parallelism.
-
+ 
+On Ubuntu, rc.local is a compatibility shim. The file `/etc/rc.local` is executed by
+systemd's `rc-local.service` during boot. Systemd manages service ordering,
+dependencies, and parallel startup.
+ 
 ### Alpine/OpenRC approach
-
+ 
 Alpine uses OpenRC as its init system. OpenRC does not use `/etc/rc.local` directly.
 Instead it uses `/etc/local.d/` — a directory of shell scripts:
-
-- Files ending in `.start` are executed at the end of the boot sequence (equivalent to
-  rc.local on Ubuntu)
+ 
+- Files ending in `.start` are executed at the end of the boot sequence (equivalent
+  to rc.local on Ubuntu)
 - Files ending in `.stop` are executed at shutdown
-- Only files that are executable are run — the `[ -x "$s" ]` check in `boot.sh` mirrors
-  what OpenRC does natively
-
-The `local` OpenRC service is what reads and runs these scripts on a real Alpine boot.
-In this challenge, `boot.sh` replays that behavior to simulate a restart.
-
+- Only executable files are run
+The `local` OpenRC service reads and runs these scripts on a real Alpine boot. In this
+challenge, `boot.sh` replays that same behavior to simulate a restart without actually
+rebooting the container.
+ 
 ### Key differences to remember
-
+ 
 | Feature | Ubuntu (systemd) | Alpine (OpenRC) |
 |---|---|---|
 | Boot script file | `/etc/rc.local` | `/etc/local.d/*.start` |
 | Init system | systemd | OpenRC |
 | Service management | `systemctl enable/start` | `rc-update add / rc-service start` |
 | Service unit files | `/etc/systemd/system/*.service` | `/etc/init.d/*` |
-| Check if service enabled | `systemctl is-enabled <name>` | `rc-update show` |
-
+| Check enabled services | `systemctl is-enabled <name>` | `rc-update show` |
+ 
 ---
-
+ 
 ## The grader's seed file — what we missed and how we found it
-
-The most important part of this level was discovering where the grader plants its token.
-We went through several wrong assumptions before finding it:
-
-**Wrong assumption 1:** The grader checks a hardcoded value like the hostname or a fixed
-string. We tried writing `"persistent"` and the hostname — both rejected with "wrong
-value."
-
-**Wrong assumption 2:** The seed file appears in `/run/` or `/tmp/` during the simulated
-restart. We wrote a diagnostic payload that dumped `/run/` and `/tmp/` during execution
-— both were empty at restart time.
-
-**The breakthrough:** We wrote a payload that dumped every file on the entire filesystem
-during the simulated restart. This output included:
-
-```
-/opt/.persist-target
-```
-
-This file was invisible in normal exploration because we had only checked `/run/`, `/tmp/`,
-and `/etc/`. The grader plants its token in `/opt/.persist-target` — a non-obvious
-location that requires a full filesystem sweep to discover.
-
-The diagnostic payload that found it:
-
+ 
+Once we understood the token system, the question became: where does the grader write
+the token? We did not know this path in advance.
+ 
+### Wrong approach: guessing
+ 
+We tried the natural locations for transient files — `/run/` and `/tmp/` — and found
+nothing. We also tried guessing specific path names like `/run/ps-persist-seed`. All
+failed. Guessing paths blind is slow and unreliable.
+ 
+### Correct approach: diagnostic payload
+ 
+The right method is to use your persistence script as a diagnostic tool first. Instead
+of writing a value, make it dump everything it can see during the simulated restart:
+ 
 ```sh
 cat > /etc/local.d/persist.start << 'EOF'
 #!/bin/sh
@@ -136,71 +168,83 @@ chmod +x /etc/local.d/persist.start
 verify
 cat /tmp/.ps-debug2
 ```
-
-This is the correct methodical approach when you don't know where a grader plants its
-seed: run your payload as a diagnostic first, dump everything you can see, then read
-the output to find what the grader placed.
-
+ 
+When the grader runs `boot.sh`, your script runs and writes a complete list of every
+file on the filesystem — including any file the grader just planted — to `/tmp/.ps-debug2`.
+After `verify` returns, you read that file from your shell.
+ 
+In the output, among hundreds of system files, one non-standard file appeared:
+ 
+```
+/opt/.persist-target
+```
+ 
+This is the grader's seed file. It was in `/opt/` — a directory we had not checked
+directly because it seemed unlikely for a per-run token. But `/opt/` is where the
+grader put it.
+ 
+The diagnostic approach works for any challenge where you don't know where the grader
+plants its input: use your payload to observe the environment, then use those
+observations to write the real payload.
+ 
 ---
-
+ 
 ## Initial hypothesis
-
+ 
 Root shell, persistence challenge. The challenge explicitly says the surface is rc-local
-startup. On Alpine that means `/etc/local.d/*.start` scripts.
-
-The grader simulates a restart by running `boot.sh`, which in turn runs all `.start`
-scripts in `/etc/local.d/`. The proof file `/tmp/.ps-persist-proof` must exist after
-that with the correct value.
-
+startup. On Alpine that means `/etc/local.d/*.start` scripts. Run verify first to find
+the proof file name, then read `boot.sh` to understand how the grader simulates a
+restart.
+ 
 ---
-
+ 
 ## Enumeration log
-
+ 
 ### Step 1 — Check the rc.local situation
-
+ 
 ```sh
 cat /etc/rc.local 2>/dev/null
 ls -la /etc/rc.local 2>/dev/null
 ls -la /etc/local.d/
 rc-status 2>/dev/null | grep local
 ```
-
+ 
 Result: no `/etc/rc.local`, `/etc/local.d/` exists but is empty, `rc-status` shows
-nothing for local. This is Alpine — the persistence surface is `/etc/local.d/`, not
-`/etc/rc.local`.
-
+nothing for the local service. On Alpine the persistence surface is `/etc/local.d/`,
+not `/etc/rc.local`.
+ 
 ---
-
-### Step 2 — Run verify to understand what the grader expects
-
+ 
+### Step 2 — Run verify to see what the grader expects
+ 
 ```sh
 verify
 ```
-
+ 
 ```
 Not solved yet. no proof after the simulated restart
 Write the value you recover to /tmp/.ps-persist-proof, then run verify again.
 ```
-
-Proof file: `/tmp/.ps-persist-proof`. The grader simulates a restart and then checks
-this file.
-
+ 
+Proof file: `/tmp/.ps-persist-proof`. The message "no proof after the simulated
+restart" means the grader ran boot.sh but the file was not there afterwards.
+ 
 ---
-
-### Step 3 — Read boot.sh to understand the mechanism
-
+ 
+### Step 3 — Read boot.sh
+ 
 ```sh
 ls /usr/local/bin/
 cat /usr/local/bin/boot.sh
 ```
-
-Reveals the exact mechanism: runs every executable `*.start` file in `/etc/local.d/`.
-This is the entry point.
-
+ 
+Reveals that `boot.sh` runs every executable `*.start` file in `/etc/local.d/`. This
+is exactly the mechanism to plant into.
+ 
 ---
-
-### Step 4 — First payload attempt (hardcoded value)
-
+ 
+### Step 4 — First payload attempt
+ 
 ```sh
 cat > /etc/local.d/persist.start << 'EOF'
 #!/bin/sh
@@ -209,26 +253,19 @@ EOF
 chmod +x /etc/local.d/persist.start
 verify
 ```
-
-Result: "the value written on restart is wrong." The script ran but the value was wrong.
-The grader wants a specific value, not a hardcoded string.
-
-**Conclusion:** The grader plants a token somewhere. Find it.
-
+ 
+Result: "the value written on restart is wrong."
+ 
+This tells us the script ran (the error changed from "no proof" to "wrong value"), but
+`"persistent"` was not the expected token. The grader wants a specific value it
+generates itself, not a hardcoded string.
+ 
+**Conclusion:** The grader plants a token somewhere before running boot.sh. Find where.
+ 
 ---
-
-### Step 5 — Wrong assumption: seed in /run/ or /tmp/
-
-Wrote a diagnostic payload to dump `/run/` and `/tmp/` during the simulated restart.
-Both were empty. Also tried known seed paths (`/run/ps-persist-seed`,
-`/tmp/.ps-persist-seed`) — none existed.
-
-Also tried the hostname as the value — rejected.
-
----
-
-### Step 6 — Diagnostic payload: full filesystem dump
-
+ 
+### Step 5 — Diagnostic payload to find the seed file
+ 
 ```sh
 cat > /etc/local.d/persist.start << 'EOF'
 #!/bin/sh
@@ -239,34 +276,35 @@ chmod +x /etc/local.d/persist.start
 verify
 cat /tmp/.ps-debug2
 ```
-
-In the output, among all the system files, one non-system file stood out:
-
+ 
+In the output, one non-system file stood out among all the standard Alpine files:
+ 
 ```
 /opt/.persist-target
 ```
-
-This is the grader's seed file. It was in `/opt/` — a directory we had not checked
-directly because it seemed unlikely for a per-run token.
-
+ 
+The environment dump showed nothing useful — no extra variables injected by the grader.
+The token is in a file, not in the environment.
+ 
 ---
-
-### Step 7 — Read the seed and confirm
-
+ 
+### Step 6 — Read the seed and confirm
+ 
 ```sh
 cat /opt/.persist-target
 ```
-
+ 
 ```
 665b2fa28da95a0386b7bb221310d292
 ```
-
-A 32-character hex string — the per-session token the grader planted.
-
+ 
+A 32-character hex string — the per-session token the grader planted in `/opt/` before
+running boot.sh.
+ 
 ---
-
-### Step 8 — Final payload
-
+ 
+### Step 7 — Final payload
+ 
 ```sh
 cat > /etc/local.d/persist.start << 'EOF'
 #!/bin/sh
@@ -275,73 +313,70 @@ EOF
 chmod +x /etc/local.d/persist.start
 verify
 ```
-
+ 
 Result: "Level solved: ps-persistence."
-
+ 
 ---
-
+ 
 ## What the vulnerability demonstrates
-
-This level simulates a real-world persistence plant. On a compromised box, an attacker
-with root can place a script in `/etc/local.d/` that runs automatically on every reboot.
-The script can do anything root can do: re-drop a SUID shell, write an SSH key, open a
-reverse shell, re-plant other mechanisms that may have been cleaned.
-
-The power of `/etc/local.d/` persistence:
-- Survives reboots
-- Survives password changes
-- Runs as root without any user interaction
-- On Alpine, requires root to plant (writing to `/etc/local.d/` is root-only)
-- Hard to notice unless you specifically audit this directory
-
-The defender's sweep for this:
-
+ 
+On a compromised box, an attacker with root can place a script in `/etc/local.d/` that
+runs automatically on every reboot as root — without any user interaction, without
+appearing in the process list during normal operation, and without showing up in
+`crontab -l` or `ps aux`.
+ 
+What a real attacker's payload might do:
+- Re-drop a SUID shell at `/tmp/.sh` in case the defender removes it
+- Re-add an SSH public key to `/root/.ssh/authorized_keys`
+- Open a reverse shell to a remote server
+- Re-install other persistence mechanisms that were cleaned
+The defender's sweep:
+ 
 ```sh
 ls -la /etc/local.d/
 cat /etc/local.d/*.start 2>/dev/null
 ```
-
-Any `.start` file not placed by the administrator is a finding.
-
+ 
+Any `.start` file not placed deliberately by an administrator is suspicious.
+ 
 ---
-
+ 
 ## Dead ends
-
-### Hardcoded value in the payload
-
-Writing a fixed string ("persistent", the hostname) — both rejected. The grader
-generates a unique per-session token. The payload must read the token, not guess it.
-
+ 
+### Hardcoded value
+ 
+Writing a fixed string (`"persistent"`, the hostname) — both rejected. The grader
+generates a unique token per `verify` call. No static value will ever match.
+ 
 ### Looking for the seed in /run/ and /tmp/
-
-Natural places to look for transient files — but the grader placed the seed in `/opt/`,
-which persists across the simulated restart. `/run/` and `/tmp/` are cleared or empty.
-
+ 
+Natural locations for transient files — but both were empty at restart time. The grader
+places its seed in `/opt/`, which is a persistent directory.
+ 
 ### Guessing the seed path
-
-Tried `/run/ps-persist-seed`, `/tmp/.ps-persist-seed`, `/run/persist-seed` — none
-existed. The correct approach was a full filesystem dump during execution, not guessing.
-
+ 
+Tried several paths (`/run/ps-persist-seed`, `/tmp/.ps-persist-seed`) — none existed.
+The correct method was the diagnostic payload, not guessing.
+ 
 ---
-
+ 
 ## Carryover findings
-
+ 
 None. The level is self-contained.
-
+ 
 ---
-
+ 
 ## Command reference
-
+ 
 | Command | What it does |
 |---|---|
 | `ls -la /etc/local.d/` | Check for existing boot scripts on Alpine |
 | `cat /usr/local/bin/boot.sh` | Read the grader's restart simulation script |
-| `cat > /etc/local.d/name.start << 'EOF' ... EOF` | Create a boot script (heredoc syntax) |
-| `chmod +x /etc/local.d/name.start` | Make the script executable — required for boot.sh to run it |
+| `cat > /etc/local.d/name.start << 'EOF' ... EOF` | Create a boot script using heredoc syntax |
+| `chmod +x /etc/local.d/name.start` | Make the script executable — required for boot.sh to pick it up |
+| `/usr/local/bin/boot.sh` | Manually trigger the simulated restart to test your payload |
 | `cat /opt/.persist-target` | Read the grader's seed token |
-| `cat /opt/.persist-target > /tmp/.ps-persist-proof` | Copy seed to proof file — what the final payload does |
-| `find / -not -path '/proc/*' -not -path '/sys/*' -type f 2>/dev/null` | Full filesystem dump — used to discover the seed file location |
+| `cat /opt/.persist-target > /tmp/.ps-persist-proof` | The final payload — copy seed to proof file |
+| `find / -not -path '/proc/*' -not -path '/sys/*' -type f 2>/dev/null` | Full filesystem dump — the diagnostic technique that revealed the seed path |
 | `rc-status 2>/dev/null` | Show OpenRC service status on Alpine |
-| `rc-update show` | Show which OpenRC services are enabled at which runlevel |
-| `/usr/local/bin/boot.sh` | Manually run the simulated restart to test the payload |
-| `printf 'VALUE' > /tmp/.ps-persist-proof && verify` | Write proof and verify |
+| `rc-update show` | Show which OpenRC services are enabled and at which runlevel |
